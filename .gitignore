@@ -98,3 +98,16 @@ tmp/
 temp/
 *.tmp
 exp/
+
+# Ignore upstream/legacy markdown files kept locally but not tracked remotely
+COMMUNICATION.md
+CONTRIBUTING.md
+SECURITY.md
+THIRD_PARTY_NOTICES.md
+CLAUDE.md
+docs/agent-social-network.md
+PROJECT_BRIEF.md
+PAGE_MAP.md
+DATA_MAP.md
+OPTIMIZATION_ROADMAP.md
+CHANGELOG.md
