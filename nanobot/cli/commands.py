@@ -893,6 +893,7 @@ def _run_gateway(
         bus,
         session_manager=session_manager,
         webui_runtime_model_name=_webui_runtime_model_name,
+        webui_recovery_action_handler=agent._apply_recovery_review_action,
     )
 
     def _pick_heartbeat_target() -> tuple[str, str]:

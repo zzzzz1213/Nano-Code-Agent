@@ -3,6 +3,7 @@ import type {
   ImageGenerationSettingsUpdate,
   MemoryCandidateCommitResult,
   ProviderSettingsUpdate,
+  RecoveryActionResult,
   SettingsPayload,
   SettingsUpdate,
   SidebarStatePayload,
@@ -163,6 +164,29 @@ export async function commitMemoryCandidate(
   query.set("candidate", JSON.stringify(candidate));
   return request<MemoryCandidateCommitResult>(
     `${base}/api/webui/memory-candidate/commit?${query}`,
+    token,
+  );
+}
+
+export async function applyRecoveryAction(
+  token: string,
+  payload: {
+    sessionKey: string;
+    toolCallId: string;
+    action: "confirm_retry" | "provide_input";
+    userInput?: string;
+  },
+  base: string = "",
+): Promise<RecoveryActionResult> {
+  const query = new URLSearchParams();
+  query.set("session_key", payload.sessionKey);
+  query.set("tool_call_id", payload.toolCallId);
+  query.set("action", payload.action);
+  if (payload.userInput !== undefined) {
+    query.set("user_input", payload.userInput);
+  }
+  return request<RecoveryActionResult>(
+    `${base}/api/webui/recovery-action?${query}`,
     token,
   );
 }

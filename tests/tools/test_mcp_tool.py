@@ -133,6 +133,7 @@ def test_tool_wrapper_infers_read_only_from_mcp_annotation() -> None:
     assert wrapper.exclusive is False
     assert wrapper.config_key == "mcp"
     assert wrapper.registration_metadata()["scopes"] == ("mcp",)
+    assert wrapper.registration_metadata()["mcp_capability_source"] == "annotation"
 
 
 def test_tool_wrapper_keeps_destructive_mcp_tool_exclusive() -> None:
@@ -161,6 +162,23 @@ def test_tool_wrapper_infers_read_only_from_name_and_description() -> None:
 
     assert wrapper.read_only is True
     assert wrapper.concurrency_safe is True
+    assert wrapper.registration_metadata()["mcp_capability_source"] == "heuristic_read"
+
+
+def test_tool_wrapper_uses_server_transport_context_for_ambiguous_docs_tool() -> None:
+    tool_def = SimpleNamespace(
+        name="assist",
+        description="Resolve a context payload for the caller",
+        inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+    wrapper = MCPToolWrapper(None, "docs_catalog", tool_def, transport_type="sse")
+
+    assert wrapper.read_only is True
+    assert wrapper.concurrency_safe is True
+    assert wrapper.registration_metadata()["mcp_transport"] == "sse"
+    assert wrapper.registration_metadata()["mcp_origin"] == "remote"
+    assert wrapper.registration_metadata()["mcp_capability_source"] == "server_transport"
 
 
 def test_tool_wrapper_treats_mutating_schema_as_exclusive() -> None:
@@ -175,6 +193,35 @@ def test_tool_wrapper_treats_mutating_schema_as_exclusive() -> None:
     assert wrapper.read_only is False
     assert wrapper.concurrency_safe is False
     assert wrapper.exclusive is True
+    assert wrapper.registration_metadata()["mcp_capability_source"] == "heuristic_mutating"
+
+
+def test_resource_wrapper_registration_metadata_marks_explicit_read_only_source() -> None:
+    resource = SimpleNamespace(name="docs", description="Documentation", uri="file:///docs/readme.md")
+
+    wrapper = MCPResourceWrapper(None, "docs_srv", resource, transport_type="stdio")
+
+    metadata = wrapper.registration_metadata()
+    assert metadata["mcp_server"] == "docs_srv"
+    assert metadata["mcp_transport"] == "stdio"
+    assert metadata["mcp_origin"] == "local"
+    assert metadata["mcp_capability_source"] == "resource"
+
+
+def test_prompt_wrapper_registration_metadata_marks_explicit_read_only_source() -> None:
+    prompt = SimpleNamespace(
+        name="triage",
+        description="Workflow prompt",
+        arguments=[SimpleNamespace(name="issue", description="Issue text", required=True)],
+    )
+
+    wrapper = MCPPromptWrapper(None, "docs_srv", prompt, transport_type="sse")
+
+    metadata = wrapper.registration_metadata()
+    assert metadata["mcp_server"] == "docs_srv"
+    assert metadata["mcp_transport"] == "sse"
+    assert metadata["mcp_origin"] == "remote"
+    assert metadata["mcp_capability_source"] == "prompt"
 
 
 def test_wrapper_preserves_non_nullable_unions() -> None:
@@ -400,6 +447,25 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
+
+
+@pytest.mark.asyncio
+async def test_execute_formats_permission_and_protocol_errors() -> None:
+    async def permission_tool(_name: str, arguments: dict) -> object:
+        raise RuntimeError("permission denied for workspace resource")
+
+    async def protocol_tool(_name: str, arguments: dict) -> object:
+        raise RuntimeError("JSONRPC protocol error: invalid json")
+
+    permission_wrapper = _make_wrapper(SimpleNamespace(call_tool=permission_tool))
+    protocol_wrapper = _make_wrapper(SimpleNamespace(call_tool=protocol_tool))
+
+    permission_result = await permission_wrapper.execute()
+    protocol_result = await protocol_wrapper.execute()
+
+    assert "permission denied" in permission_result
+    assert "RuntimeError" in permission_result
+    assert "JSONRPC protocol error" in protocol_result
 
 
 def _make_tool_def(name: str) -> SimpleNamespace:

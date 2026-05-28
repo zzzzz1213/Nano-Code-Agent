@@ -45,14 +45,14 @@ def _messages_token_estimate(messages: list[dict[str, Any]]) -> int:
 
 
 _SUMMARY_SECTION_ORDER = (
-    "overview",
     "goal",
     "constraints",
+    "decisions",
+    "failures",
     "files_touched",
     "commands_run",
-    "failures",
-    "decisions",
     "next_steps",
+    "overview",
 )
 _SUMMARY_SECTION_LABELS = {
     "overview": "Overview",
@@ -94,6 +94,33 @@ _SUMMARY_SECTION_MAX_CHARS = {
     "failures": 320,
 }
 _SUMMARY_SECTION_DEFAULT_MAX_CHARS = 240
+_FILE_PATH_RE = re.compile(
+    r"[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|json|yml|yaml|toml|ini|cfg|txt|sh|ps1|sql|html|css|scss|java|go|rs|c|cpp)",
+    re.IGNORECASE,
+)
+_FAILURE_MARKER_RE = re.compile(
+    r"(traceback|exception|error|errors|failed|failure|exit code|timed out|timeout|"
+    r"permission denied|access denied|not found|assertion|错误|失败|异常|超时|拒绝访问|未找到|权限)",
+    re.IGNORECASE,
+)
+_NEXT_STEP_RE = re.compile(
+    r"^(TODO|Next steps|Next:|Action:|Decide:|下一步|后续|待办|TODO:)",
+    re.IGNORECASE,
+)
+_DECISION_RE = re.compile(
+    r"^(Decision:|We should|Let's|User confirmed:|Confirmed:|决定|决定:)",
+    re.IGNORECASE,
+)
+_CONFIRMATION_RE = re.compile(
+    r"^(确认|已确认|可以|按这个|就这样|继续|同意|yes\b|yep\b|confirmed\b|go ahead\b|ship it\b)",
+    re.IGNORECASE,
+)
+_COMMAND_INLINE_RE = re.compile(
+    r"(pytest\b.*|ruff\s+check\b.*|npm\s+run\b.*|bun\s+run\b.*|pnpm(?:\s+run)?\b.*|"
+    r"yarn\b.*|cargo\s+test\b.*|go\s+test\b.*|python(?:3)?\s+-m\b.*|"
+    r"git\s+(?:status|diff|apply|checkout|add|commit|merge|rebase|pull|push)\b.*)",
+    re.IGNORECASE,
+)
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL,
@@ -111,18 +138,113 @@ _SECRET_FLAG_RE = re.compile(
     r"(\s--(?:api-key|token|password|secret|client-secret)(?:=|\s+))([^\s]+)",
     re.IGNORECASE,
 )
+_ENV_SECRET_RE = re.compile(
+    r"\b(?:export|set|setx)\s+([A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD)[A-Z0-9_]*)=([^\s]+)",
+    re.IGNORECASE,
+)
+_HEADER_SECRET_RE = re.compile(
+    r"\b(x-api-key|x-auth-token|api-key)\s*:\s*([^\s]+)",
+    re.IGNORECASE,
+)
 
 
 def _redact_summary_text(text: str) -> str:
     """Remove sensitive values before summary metadata reaches future prompts."""
     redacted = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
     redacted = _AUTH_BEARER_RE.sub(lambda m: f"{m.group(1)} [REDACTED]", redacted)
+    redacted = _HEADER_SECRET_RE.sub(lambda m: f"{m.group(1)}: [REDACTED]", redacted)
     redacted = _SECRET_ASSIGNMENT_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]",
         redacted,
     )
     redacted = _SECRET_FLAG_RE.sub(lambda m: f"{m.group(1)}[REDACTED]", redacted)
+    redacted = _ENV_SECRET_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
     return redacted
+
+
+def _push_recent_unique(values: list[str], item: str, *, limit: int = _SUMMARY_SECTION_MAX_ITEMS) -> None:
+    if item in values:
+        values.remove(item)
+    values.append(item)
+    if len(values) > limit:
+        del values[0]
+
+
+def _extract_file_paths(text: str) -> list[str]:
+    if not text:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _FILE_PATH_RE.finditer(text):
+        path = match.group(0)
+        if path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
+def _extract_command_lines(text: str) -> list[str]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    commands: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("`")
+        if not line:
+            continue
+        match = _COMMAND_INLINE_RE.search(line)
+        if not match:
+            continue
+        command = match.group(1).strip()
+        if command in seen:
+            continue
+        seen.add(command)
+        commands.append(command)
+    return commands
+
+
+def _failure_priority(line: str) -> tuple[int, int]:
+    lowered = line.lower()
+    if (
+        "traceback" in lowered
+        and not re.search(r"(runtimeerror|valueerror|typeerror|assertion|error:|failed|失败|错误|异常)", lowered)
+    ):
+        return (2, len(line))
+    if re.search(
+        r"(exit code|failed|failure|error:|exception|runtimeerror|assertion|timeout|timed out|"
+        r"permission denied|not found|失败|错误|异常|超时|未找到|权限)",
+        lowered,
+    ):
+        return (0, len(line))
+    return (1, len(line))
+
+
+def _extract_failure_summary(text: str) -> str | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    failure_lines = [line for line in lines if _FAILURE_MARKER_RE.search(line)]
+    if not failure_lines:
+        return None
+    ordered = sorted(
+        enumerate(failure_lines),
+        key=lambda item: (_failure_priority(item[1]), item[0]),
+    )
+    chosen: list[str] = []
+    commands = _extract_command_lines(text)
+    if commands:
+        chosen.append(f"Command: {commands[-1]}")
+    for _, line in ordered:
+        if line not in chosen:
+            chosen.append(line)
+        if len(chosen) >= 3:
+            break
+    if failure_lines[-1] not in chosen and len(chosen) < 3:
+        chosen.append(failure_lines[-1])
+    summary = " | ".join(chosen[:3]).strip()
+    return summary or None
 
 
 def _clean_summary_item(section: str, value: str) -> str:
@@ -167,12 +289,8 @@ def _parse_summary_sections(summary_text: str) -> dict[str, list[str]]:
 
     def _append(section: str, value: str) -> None:
         cleaned = _clean_summary_item(section, value)
-        if (
-            cleaned
-            and cleaned not in sections[section]
-            and len(sections[section]) < _SUMMARY_SECTION_MAX_ITEMS
-        ):
-            sections[section].append(cleaned)
+        if cleaned:
+            _push_recent_unique(sections[section], cleaned)
 
     for raw_line in summary_text.splitlines():
         line = raw_line.strip()
@@ -200,7 +318,9 @@ def _parse_summary_sections(summary_text: str) -> dict[str, list[str]]:
     if not any(sections.values()):
         return {}
     if not sections["overview"]:
-        sections["overview"] = [summary_text.strip()]
+        fallback = _clean_summary_item("overview", summary_text.strip())
+        if fallback:
+            sections["overview"] = [fallback]
     return {name: values for name, values in sections.items() if values}
 
 
@@ -216,8 +336,7 @@ def _infer_sections_from_messages(messages: list[dict[str, Any]]) -> dict[str, l
         item = _clean_summary_item(section, str(item))
         if not item:
             return
-        if item not in inferred[section] and len(inferred[section]) < _SUMMARY_SECTION_MAX_ITEMS:
-            inferred[section].append(item)
+        _push_recent_unique(inferred[section], item)
 
     for m in messages:
         # Tool call metadata convention: message may have 'tool_calls' list
@@ -231,8 +350,8 @@ def _infer_sections_from_messages(messages: list[dict[str, Any]]) -> dict[str, l
                 args = func.get("arguments") or func.get("args") or ""
                 try:
                     if isinstance(args, str):
-                        for part in re.findall(r"[\w/\\.\-]+\.(py|ts|js|md|json|yml|yaml)", args):
-                            _add("files_touched", part)
+                        for path in _extract_file_paths(args):
+                            _add("files_touched", path)
                 except Exception:
                     pass
         # File edit markers: common keys
@@ -247,18 +366,14 @@ def _infer_sections_from_messages(messages: list[dict[str, Any]]) -> dict[str, l
         # Exec-like assistant content often contains commands; capture simple patterns
         content = m.get("content") or ""
         if isinstance(content, str) and content:
-            for cmd in re.findall(r"\b(?:npm run|pytest|ruff|pip install|git (?:commit|add|apply|checkout))\b[\w\- ./]*", content):
-                _add("commands_run", cmd.strip())
+            for path in _extract_file_paths(content):
+                _add("files_touched", path)
+            for cmd in _extract_command_lines(content):
+                _add("commands_run", cmd)
             # common failure indicators
-            if re.search(r"error|failed|traceback|exception", content, re.IGNORECASE):
-                failure_lines = [
-                    line.strip()
-                    for line in content.strip().splitlines()
-                    if line.strip()
-                    and re.search(r"error|failed|traceback|exception", line, re.IGNORECASE)
-                ]
-                excerpt = " ".join((failure_lines or content.strip().splitlines())[:3])
-                _add("failures", excerpt)
+            failure_summary = _extract_failure_summary(content)
+            if failure_summary:
+                _add("failures", failure_summary)
             # decisions / next steps often start with verbs or bullets
             for line in content.splitlines():
                 line = line.strip()
@@ -268,6 +383,21 @@ def _infer_sections_from_messages(messages: list[dict[str, Any]]) -> dict[str, l
                     _add("next_steps", line)
                 if re.match(r"^(决定|决定:|Decision:|We should|Let's)", line, re.IGNORECASE):
                     _add("decisions", line)
+
+    for m in messages:
+        content = m.get("content") or ""
+        if not isinstance(content, str) or not content:
+            continue
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if m.get("role") == "user" and _CONFIRMATION_RE.match(line):
+                _add("decisions", f"User confirmed: {line}")
+            if _NEXT_STEP_RE.match(line):
+                _add("next_steps", line)
+            if _DECISION_RE.match(line):
+                _add("decisions", line)
 
     # prune empty lists
     return {k: v for k, v in inferred.items() if v}
@@ -299,10 +429,8 @@ def _sanitize_summary_sections(sections: dict[str, list[str]] | None) -> dict[st
             cleaned = _clean_summary_item(name, str(value))
             if not cleaned or cleaned in seen:
                 continue
-            values.append(cleaned)
+            _push_recent_unique(values, cleaned)
             seen.add(cleaned)
-            if len(values) >= _SUMMARY_SECTION_MAX_ITEMS:
-                break
         if values:
             sanitized[name] = values
     return sanitized
@@ -382,17 +510,13 @@ def _build_compaction_event(
     merged: dict[str, list[str]] = {}
     for name in _SUMMARY_SECTION_ORDER:
         vals: list[str] = []
-        seen = set()
+        seen: set[str] = set()
         for src in (summary_sections.get(name, []), inferred.get(name, [])):
             for v in src:
                 cleaned = _clean_summary_item(name, v)
                 if cleaned and cleaned not in seen:
-                    vals.append(cleaned)
+                    _push_recent_unique(vals, cleaned)
                     seen.add(cleaned)
-                if len(vals) >= _SUMMARY_SECTION_MAX_ITEMS:
-                    break
-            if len(vals) >= _SUMMARY_SECTION_MAX_ITEMS:
-                break
         if vals:
             merged[name] = vals
     summary_sections = _sanitize_summary_sections(merged)

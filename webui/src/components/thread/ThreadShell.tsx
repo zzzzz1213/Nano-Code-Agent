@@ -416,15 +416,17 @@ export function ThreadShell({
         hideSidebarToggleOnDesktop={hideSidebarToggleOnDesktop}
         minimal={!session && !loading}
       />
-      <ThreadViewport
-        messages={displayMessages}
-        isStreaming={isStreaming}
-        emptyState={emptyState}
-        composer={composer}
-        scrollToBottomSignal={scrollToBottomSignal}
-        conversationKey={historyKey}
-        showScrollToBottomButton={!!session}
-      />
+        <ThreadViewport
+          messages={displayMessages}
+          isStreaming={isStreaming}
+          emptyState={emptyState}
+          composer={composer}
+          scrollToBottomSignal={scrollToBottomSignal}
+          conversationKey={historyKey}
+          sessionKey={historyKey}
+          showScrollToBottomButton={!!session}
+          onResumeSafeTools={handleResumeSafeTools}
+        />
     </section>
   );
 }

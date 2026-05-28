@@ -1,7 +1,7 @@
 ---
 name: code-review
 description: "Use for engineering review tasks: identify bugs, regressions, safety risks, and missing focused tests."
-metadata: {"nanobot":{"task_keywords":["review","code review","审查","代码审查","风险","regression","回归","bug","安全"],"priority":80}}
+metadata: {"nanobot":{"task_keywords":["review","code review","审查","代码审查","风险","regression","回归","bug","安全"],"priority":80,"conflicts_with":["test-fix"]}}
 ---
 
 # Code Review

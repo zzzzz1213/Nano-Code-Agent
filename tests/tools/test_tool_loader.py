@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.registry import ToolRegistry
 
 
 class _MinimalTool(Tool):
@@ -411,3 +412,72 @@ def test_loader_registers_same_tools_as_old_hardcoded():
     }
     actual = set(registered)
     assert expected <= actual, f"Missing tools: {expected - actual}"
+
+
+def test_loader_records_plugin_name_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BuiltinTool(Tool):
+        @property
+        def name(self) -> str:
+            return "shared_tool"
+
+        @property
+        def description(self) -> str:
+            return "builtin"
+
+        @property
+        def parameters(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs: Any) -> Any:
+            return "ok"
+
+    class _PluginTool(_BuiltinTool):
+        config_key = "plugin_cfg"
+
+    loader = ToolLoader(test_classes=[_BuiltinTool])
+    monkeypatch.setattr(loader, "_discover_plugins", lambda: {"demo_plugin": _PluginTool})
+
+    registry = ToolRegistry()
+    ctx = ToolContext(config={}, workspace="/tmp")
+    loader.load(ctx, registry)
+
+    assert registry.has("shared_tool")
+    assert loader.plugin_diagnostics[-1]["code"] == "name_conflict"
+    assert loader.plugin_diagnostics[-1]["source"] == "demo_plugin"
+
+
+def test_loader_records_plugin_missing_config_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PluginTool(Tool):
+        config_key = "plugin_cfg"
+
+        @property
+        def name(self) -> str:
+            return "plugin_tool"
+
+        @property
+        def description(self) -> str:
+            return "plugin"
+
+        @property
+        def parameters(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {}}
+
+        @classmethod
+        def create(cls, ctx):
+            raise AttributeError("config.tools.plugin_cfg is missing")
+
+        async def execute(self, **kwargs: Any) -> Any:
+            return "ok"
+
+    loader = ToolLoader(test_classes=[])
+    monkeypatch.setattr(loader, "_discover_plugins", lambda: {"broken_plugin": _PluginTool})
+
+    registry = ToolRegistry()
+    ctx = ToolContext(config={}, workspace="/tmp")
+    registered = loader.load(ctx, registry)
+
+    assert registered == []
+    assert loader.plugin_diagnostics[-1]["code"] == "missing_config"
+    assert loader.plugin_diagnostics[-1]["config_key"] == "plugin_cfg"

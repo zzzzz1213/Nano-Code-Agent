@@ -1,14 +1,48 @@
 import {
   act,
+  cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AgentActivityCluster } from "@/components/thread/AgentActivityCluster";
 import type { UIMessage } from "@/lib/types";
+
+const testState = vi.hoisted(() => ({
+  applyRecoveryActionMock: vi.fn(),
+  optionalClient: null as null | {
+    token: string;
+    modelName: string | null;
+    client: { defaultChatId: string; sendMessage: ReturnType<typeof vi.fn> };
+  },
+}));
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return {
+    ...actual,
+    applyRecoveryAction: testState.applyRecoveryActionMock,
+  };
+});
+
+vi.mock("@/providers/ClientProvider", async () => {
+  const actual =
+    await vi.importActual<typeof import("@/providers/ClientProvider")>(
+      "@/providers/ClientProvider",
+    );
+  return {
+    ...actual,
+    useOptionalClient: () => testState.optionalClient,
+  };
+});
+
+async function loadApiMocks() {
+  return vi.importMock<typeof import("@/lib/api")>("@/lib/api");
+}
 
 function activityMessages(
   extraReasoning = "",
@@ -101,6 +135,151 @@ function installReducedMotion() {
 }
 
 describe("AgentActivityCluster", () => {
+  beforeEach(() => {
+    cleanup();
+    testState.optionalClient = null;
+    testState.applyRecoveryActionMock.mockReset();
+  });
+
+  it("submits recovery review actions with the real session key", async () => {
+    testState.optionalClient = {
+      token: "tok",
+      modelName: null,
+      client: {
+        defaultChatId: "chat-1",
+        sendMessage: vi.fn(),
+      },
+    };
+    await loadApiMocks();
+    testState.applyRecoveryActionMock.mockResolvedValue({
+      ok: true,
+      checkpoint: {},
+    });
+    render(
+      <AgentActivityCluster
+        messages={[
+          {
+            id: "checkpoint",
+            role: "tool",
+            kind: "trace",
+            content: "",
+            traces: [],
+            checkpoint: {
+              version: 1,
+              turn_id: "turn-1",
+              phase: "tools_completed",
+              review_required_tool_count: 1,
+              needs_input_tool_count: 1,
+              recovery_review_items: [
+                {
+                  tool_call_id: "call-shell",
+                  name: "exec",
+                  group: "review_required",
+                  action_label: "Review before retry",
+                  review_state: "awaiting_review",
+                  status_label: "Waiting for confirmation",
+                },
+                {
+                  tool_call_id: "call-input",
+                  name: "mcp_fetch_context",
+                  group: "needs_input",
+                  action_label: "Collect input",
+                  review_state: "awaiting_input",
+                  status_label: "Waiting for input",
+                  input_placeholder: "Provide the missing query details",
+                },
+              ],
+              updated_at: "2026-05-21T00:00:00+00:00",
+            },
+            createdAt: 3,
+          },
+        ]}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+        sessionKey="websocket:chat-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /0 tool calls/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm retry" }));
+
+    await waitFor(() => {
+      expect(testState.applyRecoveryActionMock).toHaveBeenCalledWith("tok", {
+        sessionKey: "websocket:chat-1",
+        toolCallId: "call-shell",
+        action: "confirm_retry",
+        userInput: undefined,
+      });
+    });
+    expect(screen.getByText("Retry confirmed")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("Provide the missing query details"), {
+      target: { value: "use latest logs" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Submit input" }));
+
+    await waitFor(() => {
+      expect(testState.applyRecoveryActionMock).toHaveBeenNthCalledWith(2, "tok", {
+        sessionKey: "websocket:chat-1",
+        toolCallId: "call-input",
+        action: "provide_input",
+        userInput: "use latest logs",
+      });
+    });
+    expect(screen.getByText("Input collected")).toBeInTheDocument();
+  });
+
+  it("shows local validation when a needs-input action is submitted empty", async () => {
+    testState.optionalClient = {
+      token: "tok",
+      modelName: null,
+      client: {
+        defaultChatId: "chat-1",
+        sendMessage: vi.fn(),
+      },
+    };
+    render(
+      <AgentActivityCluster
+        messages={[
+          {
+            id: "checkpoint",
+            role: "tool",
+            kind: "trace",
+            content: "",
+            traces: [],
+            checkpoint: {
+              version: 1,
+              turn_id: "turn-1",
+              phase: "tools_completed",
+              needs_input_tool_count: 1,
+              recovery_review_items: [
+                {
+                  tool_call_id: "call-input",
+                  name: "mcp_fetch_context",
+                  group: "needs_input",
+                  action_label: "Collect input",
+                  review_state: "awaiting_input",
+                  input_placeholder: "Provide missing input for mcp_fetch_context",
+                },
+              ],
+              updated_at: "2026-05-21T00:00:00+00:00",
+            },
+            createdAt: 3,
+          },
+        ]}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+        sessionKey="websocket:chat-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /0 tool calls/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Submit input" }));
+
+    expect(screen.getByText("Input required")).toBeInTheDocument();
+    expect(testState.applyRecoveryActionMock).not.toHaveBeenCalled();
+  });
+
   it("jumps to the latest activity when opened", () => {
     const raf = installAnimationFrameQueue();
     try {
@@ -386,20 +565,20 @@ describe("AgentActivityCluster", () => {
       expect(screen.getByText("Task snapshot")).toBeInTheDocument();
       expect(screen.getByText("Phase")).toBeInTheDocument();
       expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
-      expect(screen.getByText("Files")).toBeInTheDocument();
-      expect(screen.getByText("Checks")).toBeInTheDocument();
+      expect(screen.getAllByText("Files").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Checks").length).toBeGreaterThan(0);
       expect(screen.getByText("Rebuilt from history")).toBeInTheDocument();
-      expect(screen.getByText("Reading")).toBeInTheDocument();
+      expect(screen.getAllByText("Reading").length).toBeGreaterThan(0);
       expect(screen.getAllByText("Tools").length).toBeGreaterThan(0);
-      expect(screen.getByText("Editing")).toBeInTheDocument();
-      expect(screen.getByText("Checking")).toBeInTheDocument();
+      expect(screen.getAllByText("Editing").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Checking").length).toBeGreaterThan(0);
       expect(screen.getAllByText("Done").length).toBeGreaterThan(0);
-      expect(screen.getByText("Frontend")).toBeInTheDocument();
-      expect(screen.getByText("Backend")).toBeInTheDocument();
-      expect(screen.getByText("Docs")).toBeInTheDocument();
-      expect(screen.getByText("Modified")).toBeInTheDocument();
-      expect(screen.getByText("Deleted")).toBeInTheDocument();
-      expect(screen.getByText("Added")).toBeInTheDocument();
+      expect(screen.getAllByText("Frontend").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Backend").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Docs").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Modified").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Deleted").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Added").length).toBeGreaterThan(0);
       expect(screen.getByText("tsx")).toBeInTheDocument();
       expect(screen.getByText("py")).toBeInTheDocument();
       expect(screen.getByText("md")).toBeInTheDocument();
@@ -441,7 +620,7 @@ describe("AgentActivityCluster", () => {
     expect(screen.getAllByText("Checks").length).toBeGreaterThan(0);
     expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.getByText("Check")).toBeInTheDocument();
-    expect(screen.getByText("pytest tests/agent -q")).toBeInTheDocument();
+    expect(screen.getAllByText("pytest tests/agent -q").length).toBeGreaterThan(0);
   });
 
   it("uses backend checkpoint data for task snapshots when traces are sparse", () => {
@@ -477,8 +656,116 @@ describe("AgentActivityCluster", () => {
     expect(screen.getByText(/Tools · Tool results saved/)).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
     expect(screen.getByText("1 · +0 -0")).toBeInTheDocument();
-    expect(screen.getByText("1 passed")).toBeInTheDocument();
+    expect(screen.getAllByText("1 passed").length).toBeGreaterThan(0);
     expect(screen.getByText("Rebuilt from history")).toBeInTheDocument();
+  });
+
+  it("renders workbench cards for task plan, checks, and turn summary", () => {
+    render(
+      <AgentActivityCluster
+        messages={activityMessages("", {
+          id: "t-workbench",
+          role: "tool",
+          kind: "trace",
+          content: "",
+          traces: [],
+          toolEvents: [
+            {
+              phase: "end",
+              call_id: "call-check",
+              name: "exec",
+              arguments: { command: "pytest tests/agent -q" },
+              result:
+                "================= 1 failed, 2 passed in 0.42s =================\nExit code: 1",
+              failure_category: "tool_exception",
+              diagnostic_label: "Test failure",
+              diagnostic_hint:
+                "The latest pytest run still has a failing assertion.",
+              recommended_action:
+                "Rerun the targeted pytest command after fixing the failing test.",
+            },
+          ],
+          checkpoint: {
+            version: 1,
+            turn_id: "turn-workbench",
+            phase: "tools_completed",
+            tool_call_count: 3,
+            file_edit_count: 1,
+            check_state: "failed",
+            updated_at: "2026-05-21T00:00:00+00:00",
+          },
+          fileEdits: [
+            {
+              call_id: "call-edit",
+              tool: "edit_file",
+              path: "nanobot/agent/runner.py",
+              phase: "end",
+              added: 180,
+              deleted: 60,
+              status: "done",
+              approximate: true,
+            },
+            {
+              call_id: "call-binary",
+              tool: "write_file",
+              path: "docs/architecture.png",
+              phase: "end",
+              added: 0,
+              deleted: 0,
+              status: "done",
+              binary: true,
+            },
+          ],
+          createdAt: 3,
+        })}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /checking.*1 failed/i }));
+    const checkResults = screen.getByLabelText("Check results");
+    const diffPreview = screen.getByLabelText("Diff preview");
+    const turnSummary = screen.getByLabelText("Turn summary");
+    expect(screen.getByText("Task plan")).toBeInTheDocument();
+    expect(screen.getByText("Check results")).toBeInTheDocument();
+    expect(screen.getByText("Diff preview")).toBeInTheDocument();
+    expect(screen.getByText("Turn summary")).toBeInTheDocument();
+    expect(screen.getByLabelText("Task plan")).toBeInTheDocument();
+    expect(checkResults).toBeInTheDocument();
+    expect(diffPreview).toBeInTheDocument();
+    expect(turnSummary).toBeInTheDocument();
+    expect(screen.getByText("Resolve failing checks")).toBeInTheDocument();
+    expect(
+      within(screen.getByLabelText("Task plan")).getByRole("button", {
+        name: "Open checks",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(checkResults).getAllByText("pytest tests/agent -q").length,
+    ).toBeGreaterThan(0);
+    expect(within(checkResults).getByText("Tool exception")).toBeInTheDocument();
+    expect(within(checkResults).getByText("Test failure")).toBeInTheDocument();
+    expect(within(checkResults).getByText(/1 failed, 2 passed/i)).toBeInTheDocument();
+    expect(
+      within(checkResults).getByText(/failing assertion/i),
+    ).toBeInTheDocument();
+    expect(
+      within(checkResults).getByText(/Rerun the targeted pytest command/i),
+    ).toBeInTheDocument();
+    expect(within(diffPreview).getByText("nanobot/agent/runner.py")).toBeInTheDocument();
+    expect(within(diffPreview).getByText("docs/architecture.png")).toBeInTheDocument();
+    expect(within(diffPreview).getByText("Large change")).toBeInTheDocument();
+    expect(within(diffPreview).getByText("Binary")).toBeInTheDocument();
+    expect(within(turnSummary).getByText("Edited 2 files (+180 -60).")).toBeInTheDocument();
+    expect(
+      within(turnSummary).getByText(
+        "Inspect the failing check summary and rerun the focused command.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(turnSummary).getByRole("button", { name: "Open checks" }),
+    ).toBeInTheDocument();
   });
 
   it("renders context compaction snapshots distinctly", () => {
@@ -708,6 +995,7 @@ describe("AgentActivityCluster", () => {
   });
 
   it("marks recovered checkpoint snapshots distinctly", () => {
+    const onResumeSafeTools = vi.fn();
     render(
       <AgentActivityCluster
         messages={[
@@ -744,6 +1032,11 @@ describe("AgentActivityCluster", () => {
                   group: "safe_resume",
                   reason: "read_only_safe_candidate",
                   recovery_action: "resume_safe",
+                  action_label: "Resume safe tools",
+                  review_kind: "read_only",
+                  summary: "path: nanobot/agent/runner.py",
+                  scope: "core",
+                  can_resume_now: true,
                 },
                 {
                   tool_call_id: "call-shell",
@@ -751,6 +1044,10 @@ describe("AgentActivityCluster", () => {
                   group: "review_required",
                   reason: "shell_command_requires_review",
                   recovery_action: "review_before_retry",
+                  action_label: "Review before retry",
+                  review_kind: "shell",
+                  summary: "command available during review",
+                  scope: "core",
                 },
                 {
                   tool_call_id: "call-input",
@@ -758,6 +1055,10 @@ describe("AgentActivityCluster", () => {
                   group: "needs_input",
                   reason: "requires_user_input",
                   recovery_action: "provide_input",
+                  action_label: "Collect input",
+                  review_kind: "needs_input",
+                  summary: "query: current build error",
+                  scope: "mcp",
                 },
                 {
                   tool_call_id: "call-blocked",
@@ -765,6 +1066,10 @@ describe("AgentActivityCluster", () => {
                   group: "blocked",
                   reason: "blocked_by_safety_policy",
                   recovery_action: "revise_request",
+                  action_label: "Revise request",
+                  review_kind: "blocked",
+                  summary: "path: .env",
+                  scope: "core",
                 },
               ],
               recovery_review_count: 4,
@@ -775,11 +1080,13 @@ describe("AgentActivityCluster", () => {
         ]}
         isTurnStreaming={false}
         hasBodyBelow={false}
+        onResumeSafeTools={onResumeSafeTools}
       />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: /0 tool calls/i }));
     expect(screen.getByLabelText("Task snapshot")).toBeInTheDocument();
+    expect(screen.getByLabelText("Task plan")).toBeInTheDocument();
     expect(screen.getByText("Recovered checkpoint")).toBeInTheDocument();
     expect(screen.getByText("Reused 1")).toBeInTheDocument();
     expect(screen.getByText("Compensated 1")).toBeInTheDocument();
@@ -790,17 +1097,30 @@ describe("AgentActivityCluster", () => {
     expect(
       screen.getByText("Review before retry: 1 need review, 1 need input, 1 blocked."),
     ).toBeInTheDocument();
+    expect(screen.getByText("Review recovery actions")).toBeInTheDocument();
+    expect(screen.getByText("4 pending items")).toBeInTheDocument();
+    expect(
+      within(screen.getByLabelText("Task plan")).getByRole("button", {
+        name: "Open review",
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Recovery review")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Resume safe tools" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("read_file")).toBeInTheDocument();
     expect(screen.getByText("Safe resume")).toBeInTheDocument();
+    expect(screen.getByText("path: nanobot/agent/runner.py")).toBeInTheDocument();
     expect(screen.getByText("Read only safe candidate")).toBeInTheDocument();
     expect(screen.getByText("exec")).toBeInTheDocument();
     expect(screen.getByText("Shell command requires review")).toBeInTheDocument();
     expect(screen.getByText("mcp_fetch_context")).toBeInTheDocument();
-    expect(screen.getByText("Provide input")).toBeInTheDocument();
+    expect(screen.getByText("Collect input")).toBeInTheDocument();
     expect(screen.getByText("write_file")).toBeInTheDocument();
     expect(screen.getByText("Blocked by safety policy")).toBeInTheDocument();
     expect(screen.getByText("Needs input 1")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume safe tools" }));
+    expect(onResumeSafeTools).toHaveBeenCalledTimes(1);
     expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
   });
 
@@ -836,11 +1156,12 @@ describe("AgentActivityCluster", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /checking.*1 failed/i }),
     );
+    const checkResults = screen.getByLabelText("Check results");
     expect(screen.getByLabelText("Task snapshot")).toBeInTheDocument();
     expect(screen.getByText("Needs attention")).toBeInTheDocument();
     expect(screen.getAllByText("1 failed").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Failed").length).toBeGreaterThan(0);
-    expect(screen.getByText(/1 failed, 2 passed/)).toBeInTheDocument();
+    expect(within(checkResults).getByText(/1 failed, 2 passed/)).toBeInTheDocument();
   });
 
   it("shows structured tool risk and blocked shell labels", () => {
@@ -916,7 +1237,53 @@ describe("AgentActivityCluster", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /checking/i }));
     expect(screen.getByText("Retryable")).toBeInTheDocument();
-    expect(screen.getByText("npm run test")).toBeInTheDocument();
+    expect(screen.getAllByText("npm run test").length).toBeGreaterThan(0);
+  });
+
+  it("shows MCP diagnostic labels and suggestions", () => {
+    render(
+      <AgentActivityCluster
+        messages={activityMessages("", {
+          id: "t-mcp-diagnostic",
+          role: "tool",
+          kind: "trace",
+          content: "",
+          traces: [],
+          toolEvents: [
+            {
+              phase: "error",
+              call_id: "call-mcp-protocol",
+              name: "mcp_docs_lookup",
+              arguments: { query: "runner retry policy" },
+              error: "(MCP tool call failed: JSONRPC protocol error [RuntimeError: invalid json])",
+              risk_category: "mcp",
+              risk_level: "medium",
+              failure_category: "mcp_protocol_error",
+              recovery_action: "revise_request",
+              retryable: false,
+              needs_user_input: true,
+              diagnostic_label: "Protocol error",
+              diagnostic_hint:
+                "The MCP server returned malformed JSON-RPC or polluted stdout.",
+              recommended_action:
+                "Check the MCP server logs and ensure protocol output stays on stdout only.",
+            },
+          ],
+          createdAt: 3,
+        })}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /tools/i }));
+    expect(screen.getByText("Protocol error")).toBeInTheDocument();
+    expect(
+      screen.getByText(/The MCP server returned malformed JSON-RPC or polluted stdout\./),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/ensure protocol output stays on stdout only\./),
+    ).toBeInTheDocument();
   });
 
   it("shows queued and running tool scheduling metadata", () => {

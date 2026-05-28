@@ -100,6 +100,15 @@ _CANONICAL_REPLACEMENTS = (
     ("concise", "brief"),
     ("succinct", "brief"),
 )
+_NEGATION_MARKERS = ("不", "不要", "别", "勿", "no ", "not ", "don't", "do not", "never")
+_CONFLICT_GROUPS = (
+    ("中文", "英文"),
+    ("chinese", "english"),
+    ("简洁", "详细"),
+    ("brief", "detailed"),
+    ("正式", "随意"),
+    ("formal", "casual"),
+)
 
 
 class MemoryCandidateError(ValueError):
@@ -173,7 +182,8 @@ def _write_target_text(store: MemoryStore, candidate_type: str, text: str) -> No
 
 
 def _contains_duplicate(existing: str, content: str) -> bool:
-    return _find_duplicate(existing, content) is not None
+    match = _find_duplicate(existing, content)
+    return bool(match and match["reason"] == "exact_or_contained")
 
 
 def _iter_existing_memory_items(existing: str) -> list[str]:
@@ -212,10 +222,22 @@ def _find_duplicate(existing: str, content: str) -> dict[str, Any] | None:
         haystack = _canonical_memory_text(item)
         if not haystack:
             continue
-        if needle == haystack or needle in haystack or haystack in needle:
+        if needle == haystack or needle in haystack:
             return {
                 "reason": "exact_or_contained",
                 "existing_preview": truncate_text(item, 160),
+                "existing_item": item,
+                "score": 1.0,
+            }
+        if haystack in needle:
+            merged = _merge_memory_item(item, content)
+            return {
+                "reason": "similar_merge_candidate",
+                "merge_action": "merge_existing",
+                "merge_reason": "candidate_extends_existing",
+                "existing_preview": truncate_text(item, 160),
+                "existing_item": item,
+                "merged_content": merged,
                 "score": 1.0,
             }
 
@@ -227,16 +249,102 @@ def _find_duplicate(existing: str, content: str) -> dict[str, Any] | None:
         union = len(needle_tokens | haystack_tokens)
         similarity = overlap / union if union else 0.0
         containment = overlap / min(len(needle_tokens), len(haystack_tokens))
+        conflict_reason = _detect_memory_conflict(item, content)
+        if conflict_reason and (similarity >= 0.6 or containment >= 0.7):
+            merged = _merge_memory_item(item, content)
+            return {
+                "reason": "conflict_review_required",
+                "merge_action": "review_conflict",
+                "merge_reason": None,
+                "conflict_reason": conflict_reason,
+                "existing_preview": truncate_text(item, 160),
+                "existing_item": item,
+                "merged_content": merged,
+                "score": round(max(similarity, containment), 3),
+            }
         if (
             similarity >= _SIMILARITY_THRESHOLD
             or containment >= _CONTAINMENT_THRESHOLD
         ):
+            merged = _merge_memory_item(item, content)
             return {
-                "reason": "similar_content",
+                "reason": "conflict_review_required" if conflict_reason else "similar_merge_candidate",
+                "merge_action": "review_conflict" if conflict_reason else "merge_existing",
+                "merge_reason": None if conflict_reason else "similar_content",
+                "conflict_reason": conflict_reason,
                 "existing_preview": truncate_text(item, 160),
+                "existing_item": item,
+                "merged_content": merged,
                 "score": round(max(similarity, containment), 3),
             }
     return None
+
+
+def _contains_negation(text: str) -> bool:
+    lowered = text.casefold()
+    return any(marker in lowered for marker in _NEGATION_MARKERS)
+
+
+def _detect_memory_conflict(existing_item: str, content: str) -> str | None:
+    existing_canonical = _canonical_memory_text(existing_item)
+    candidate_canonical = _canonical_memory_text(content)
+    existing_negated = _contains_negation(existing_item)
+    candidate_negated = _contains_negation(content)
+    if existing_negated != candidate_negated:
+        return "opposite_preference_polarity"
+    for left, right in _CONFLICT_GROUPS:
+        left_present = left in existing_canonical or left in candidate_canonical
+        right_present = right in existing_canonical or right in candidate_canonical
+        if not (left_present and right_present):
+            continue
+        existing_side = left if left in existing_canonical else right if right in existing_canonical else None
+        candidate_side = left if left in candidate_canonical else right if right in candidate_canonical else None
+        if existing_side and candidate_side and existing_side != candidate_side:
+            return f"conflicting_value:{left}|{right}"
+    return None
+
+
+def _merge_memory_item(existing_item: str, content: str) -> str:
+    existing = _normalize_candidate_text(existing_item)
+    candidate = _normalize_candidate_text(content)
+    if not existing:
+        return candidate
+    if not candidate:
+        return existing
+    existing_canonical = _canonical_memory_text(existing)
+    candidate_canonical = _canonical_memory_text(candidate)
+    if candidate_canonical == existing_canonical:
+        return existing if len(existing) >= len(candidate) else candidate
+    if existing_canonical in candidate_canonical:
+        return candidate
+    if candidate_canonical in existing_canonical:
+        return existing
+    if len(candidate) > len(existing):
+        return candidate
+    return existing
+
+
+def _merge_memory_text(existing: str, existing_item: str, merged_content: str, header: str) -> str:
+    merged_line = f"- {merged_content}"
+    lines = existing.splitlines()
+    updated_lines: list[str] = []
+    replaced = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        cleaned = _MEMORY_LINE_PREFIX_RE.sub("", line).strip() if line and not line.startswith("#") else ""
+        if not replaced and cleaned == existing_item.strip():
+            updated_lines.append(merged_line)
+            replaced = True
+            continue
+        updated_lines.append(raw_line)
+    if not updated_lines:
+        return f"{header}\n\n{merged_line}\n"
+    updated = "\n".join(updated_lines).rstrip()
+    if not replaced:
+        if not updated:
+            return f"{header}\n\n{merged_line}\n"
+        return f"{updated}\n\n{merged_line}\n"
+    return f"{updated}\n"
 
 
 def build_memory_candidate(
@@ -259,7 +367,8 @@ def build_memory_candidate(
         return None
     candidate_type = _candidate_type(content)
     target = MEMORY_CANDIDATE_TYPES[candidate_type]["target"]
-    if _contains_duplicate(_target_text(memory, candidate_type), content):
+    existing_match = _find_duplicate(_target_text(memory, candidate_type), content)
+    if existing_match and existing_match["reason"] == "exact_or_contained":
         return None
     digest = hashlib.sha256(f"{candidate_type}\0{target}\0{content}".encode("utf-8")).hexdigest()
     preview = truncate_text(assistant_text.strip(), 160) if assistant_text else ""
@@ -278,6 +387,18 @@ def build_memory_candidate(
         "duplicate": False,
         "created_at": datetime.now(UTC).isoformat(),
     }
+    if existing_match:
+        candidate["existing_preview"] = existing_match.get("existing_preview")
+        if isinstance(existing_match.get("merge_action"), str):
+            candidate["merge_action"] = existing_match["merge_action"]
+        if isinstance(existing_match.get("merge_reason"), str):
+            candidate["merge_reason"] = existing_match["merge_reason"]
+        if isinstance(existing_match.get("conflict_reason"), str):
+            candidate["conflict_reason"] = existing_match["conflict_reason"]
+        if isinstance(existing_match.get("merged_content"), str):
+            candidate["merged_content"] = existing_match["merged_content"]
+        if isinstance(existing_match.get("score"), (int, float)):
+            candidate["merge_score"] = existing_match["score"]
     return candidate
 
 
@@ -318,6 +439,38 @@ def commit_memory_candidate(memory: MemoryStore, candidate: Any) -> dict[str, An
     content = normalized["content"]
     duplicate = _find_duplicate(existing, content)
     if duplicate:
+        if duplicate["reason"] == "similar_merge_candidate":
+            merged_content = str(duplicate.get("merged_content") or content)
+            updated = _merge_memory_text(
+                existing,
+                str(duplicate.get("existing_item") or ""),
+                merged_content,
+                MEMORY_CANDIDATE_TYPES[candidate_type]["header"],
+            )
+            _write_target_text(memory, candidate_type, updated)
+            return {
+                "committed": True,
+                "duplicate": False,
+                "merged": True,
+                "merge_action": duplicate.get("merge_action"),
+                "merge_reason": duplicate.get("merge_reason"),
+                "existing_preview": duplicate["existing_preview"],
+                "merged_content": merged_content,
+                "target": normalized["target"],
+                "candidate": normalized,
+            }
+        if duplicate["reason"] == "conflict_review_required":
+            return {
+                "committed": False,
+                "duplicate": False,
+                "conflict": True,
+                "merge_action": duplicate.get("merge_action"),
+                "conflict_reason": duplicate.get("conflict_reason"),
+                "existing_preview": duplicate["existing_preview"],
+                "merged_content": duplicate.get("merged_content"),
+                "target": normalized["target"],
+                "candidate": normalized,
+            }
         return {
             "committed": False,
             "duplicate": True,

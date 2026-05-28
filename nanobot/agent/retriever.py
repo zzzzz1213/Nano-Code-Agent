@@ -1,24 +1,96 @@
 from __future__ import annotations
 
-import re
-import time
 import json
-import threading
-import queue
-import os
-from collections import defaultdict
 import math
+import os
+import queue
+import re
 import statistics
-from typing import Dict, List, Tuple
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-
+from typing import Any, Dict, List, Tuple
 
 _PATH_TOKEN_RE = re.compile(r"[\w./\\-]+\.[A-Za-z0-9]+")
+_QUERY_NOISE_TOKENS = frozenset((
+    "current",
+    "request",
+    "requests",
+    "signals",
+    "signal",
+    "recent",
+    "history",
+    "please",
+    "check",
+    "inspect",
+    "look",
+    "into",
+    "about",
+    "with",
+    "this",
+    "that",
+    "from",
+    "then",
+    "need",
+    "help",
+    "after",
+    "before",
+    "continue",
+    "user",
+    "confirmed",
+))
+_FAILURE_TERMS = frozenset((
+    "error",
+    "failed",
+    "failure",
+    "traceback",
+    "exception",
+    "timeout",
+    "denied",
+    "blocked",
+    "错误",
+    "失败",
+    "异常",
+))
+_COMMAND_TERMS = frozenset((
+    "pytest",
+    "ruff",
+    "npm",
+    "bun",
+    "docker",
+    "command",
+    "commands",
+    "build",
+    "test",
+    "tests",
+    "命令",
+))
+_DECISION_TERMS = frozenset((
+    "decision",
+    "decided",
+    "choose",
+    "chose",
+    "confirmed",
+    "keep",
+    "continue",
+    "选择",
+    "决定",
+    "确认",
+))
+_SECTION_CATEGORY_MAP = {
+    "decisions": "decision",
+    "commands_run": "command",
+    "failures": "failure",
+}
 
 
 def _tokenize(text: str) -> List[str]:
-    tokens = [t for t in re.split(r"\W+", text.lower()) if t]
+    tokens = [
+        t for t in re.split(r"\W+", text.lower())
+        if t and len(t) > 1 and t not in _QUERY_NOISE_TOKENS
+    ]
     path_tokens = [p.lower() for p in _PATH_TOKEN_RE.findall(text)]
     return tokens + [p for p in path_tokens if p not in tokens]
 
@@ -105,12 +177,12 @@ def _section_text(sections: dict | None, key: str) -> str:
 
 def _classify_memory(text: str, sections: dict | None) -> str:
     lowered = text.lower()
+    if _section_text(sections, "decisions"):
+        return "decision"
     if _section_text(sections, "commands_run"):
         return "command"
     if _section_text(sections, "failures"):
         return "failure"
-    if _section_text(sections, "decisions"):
-        return "decision"
     if any(keyword in lowered for keyword in _CATEGORY_KEYWORDS["decision"]):
         return "decision"
     for category, keywords in _CATEGORY_KEYWORDS.items():
@@ -119,23 +191,112 @@ def _classify_memory(text: str, sections: dict | None) -> str:
     return "project_fact"
 
 
-def _match_reason(query_tokens: list[str], doc_text: str, sections: dict | None, category: str) -> str:
+def _parse_timestamp(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(datetime.fromisoformat(value).timestamp())
+        except Exception:
+            try:
+                return float(value)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _extract_query_features(query_text: str) -> dict[str, Any]:
+    tokens = _tokenize(query_text)
+    token_set = set(tokens)
+    path_terms = [token for token in tokens if "." in token or "/" in token or "\\" in token]
+    section_hints: list[str] = []
+    category_hints: list[str] = []
+    if token_set & _FAILURE_TERMS:
+        section_hints.append("failures")
+        category_hints.append("failure")
+    if token_set & _COMMAND_TERMS:
+        section_hints.append("commands_run")
+        category_hints.append("command")
+    if token_set & _DECISION_TERMS:
+        section_hints.append("decisions")
+        category_hints.append("decision")
+    strong_terms = {
+        token
+        for token in tokens
+        if len(token) >= 4 or token in _FAILURE_TERMS or token in _COMMAND_TERMS or token in _DECISION_TERMS
+    }
+    return {
+        "tokens": tokens,
+        "token_set": token_set,
+        "path_terms": path_terms,
+        "section_hints": section_hints,
+        "category_hints": category_hints,
+        "strong_terms": strong_terms,
+    }
+
+
+def _match_reason(
+    query_features: dict[str, Any],
+    doc_text: str,
+    sections: dict | None,
+    category: str,
+) -> str:
     lowered = doc_text.lower()
-    path_terms = [
-        token for token in query_tokens
-        if "." in token or "/" in token or "\\" in token
-    ]
+    path_terms = query_features.get("path_terms") or []
     for term in path_terms:
         if term.lower() in lowered:
             return f"path:{term}"
+    for section in query_features.get("section_hints") or []:
+        section_value = _section_text(sections, section).lower()
+        if section_value:
+            return f"section:{section}"
     for section in ("failures", "commands_run", "decisions"):
         section_value = _section_text(sections, section).lower()
-        if section_value and any(token in section_value for token in query_tokens):
+        if section_value and any(token in section_value for token in query_features.get("tokens") or []):
             return f"section:{section}"
-    matched = [token for token in query_tokens if token in lowered]
+    matched = [token for token in query_features.get("strong_terms") or [] if token in lowered]
+    if matched:
+        return f"term:{sorted(matched, key=len, reverse=True)[0]}"
+    matched = [token for token in query_features.get("tokens") or [] if token in lowered]
     if matched:
         return f"term:{matched[0]}"
     return f"category:{category}"
+
+
+def _section_match_bonus(query_features: dict[str, Any], doc: dict[str, Any]) -> float:
+    sections = doc.get("summary_sections") if isinstance(doc.get("summary_sections"), dict) else None
+    if not sections:
+        return 0.0
+    bonus = 0.0
+    for section in query_features.get("section_hints") or []:
+        if _section_text(sections, section):
+            if section == "failures":
+                bonus += 1.8
+            elif section == "commands_run":
+                bonus += 1.4
+            elif section == "decisions":
+                bonus += 1.2
+    return bonus
+
+
+def _path_match_bonus(query_features: dict[str, Any], doc_text: str) -> float:
+    lowered = doc_text.lower()
+    bonus = 0.0
+    for term in query_features.get("path_terms") or []:
+        if term in lowered:
+            bonus = max(bonus, 3.0)
+            continue
+        basename = term.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+        if basename and basename in lowered:
+            bonus = max(bonus, 1.5)
+    return bonus
+
+
+def _category_alignment_bonus(query_features: dict[str, Any], category: str) -> float:
+    hints = query_features.get("category_hints") or []
+    if category in hints:
+        return 0.6
+    return 0.0
 
 
 class MemoryRetriever:
@@ -424,24 +585,29 @@ class MemoryRetriever:
     def query(self, query_text: str, top_k: int = 5) -> List[Dict]:
         """Return top_k matching compactions for the query_text.
 
-        Scoring: sum of term TF in doc, divided by sqrt(token_count), with a small recency boost.
+        Scoring: BM25-like term score plus explicit path/section/category alignment
+        bonuses and a relative recency boost inside the current result set.
         """
         with self._lock:
             if not self._docs:
                 return []
-            qtokens = _tokenize(query_text)
+            query_features = _extract_query_features(query_text)
+            qtokens = query_features["tokens"]
+            if not qtokens:
+                return []
             scores: Dict[str, float] = defaultdict(float)
 
             # BM25-like scoring parameters
-            N = max(1, len(self._docs))
+            doc_count = max(1, len(self._docs))
             avgdl = max(1.0, statistics.mean([d.get("token_count", 1) for d in self._docs.values()]))
             k1 = 1.2
             b = 0.75
 
             for t in qtokens:
+                token_weight = 1.15 if t in query_features["strong_terms"] else 1.0
                 postings = list(self._index.get(t, []) if isinstance(self._index.get(t, []), list) else [])
                 df = max(1, len(postings))
-                idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+                idf = math.log((doc_count - df + 0.5) / (df + 0.5) + 1.0)
                 for doc_id, tf in postings:
                     doc = self._docs.get(doc_id)
                     if not doc:
@@ -449,35 +615,36 @@ class MemoryRetriever:
                     dl = max(1.0, doc.get("token_count", 1))
                     denom = tf + k1 * (1 - b + b * (dl / avgdl))
                     score_term = idf * ((tf * (k1 + 1)) / denom)
-                    scores[doc_id] += score_term
+                    scores[doc_id] += score_term * token_weight
 
             results: List[Tuple[str, float]] = []
             qtext = query_text.lower().strip()
+            recency_values = [
+                _parse_timestamp(self._docs[doc_id].get("updated_at"))
+                for doc_id in scores
+                if doc_id in self._docs
+            ]
+            newest = max(recency_values) if recency_values else 0.0
+            oldest = min(recency_values) if recency_values else 0.0
+            span = max(1.0, newest - oldest)
             for doc_id, score in scores.items():
                 doc = self._docs.get(doc_id)
                 if not doc:
                     continue
-                # recency as timestamp
-                raw_recency = doc.get("updated_at", 0)
-                recency = 0.0
-                if isinstance(raw_recency, (int, float)):
-                    recency = float(raw_recency)
-                elif isinstance(raw_recency, str):
-                    try:
-                        recency = float(datetime.fromisoformat(raw_recency).timestamp())
-                    except Exception:
-                        try:
-                            recency = float(raw_recency)
-                        except Exception:
-                            recency = 0.0
-                recency_boost = 1.0 + min(0.2, (recency / (60 * 60 * 24 * 30)) * 0.01) if recency > 0 else 1.0
+                recency = _parse_timestamp(doc.get("updated_at"))
+                recency_ratio = ((recency - oldest) / span) if recency > 0 else 0.0
+                recency_boost = 1.0 + (0.35 * max(0.0, min(1.0, recency_ratio)))
 
                 # phrase/substring match bonus
                 phrase_bonus = 0.0
                 if qtext and qtext in (doc.get("text") or "").lower():
                     phrase_bonus = 0.5
 
-                final = (score * recency_boost) + phrase_bonus
+                category = doc.get("category") or (doc.get("meta") or {}).get("category") or "project_fact"
+                path_bonus = _path_match_bonus(query_features, doc.get("text") or "")
+                section_bonus = _section_match_bonus(query_features, doc)
+                category_bonus = _category_alignment_bonus(query_features, category)
+                final = (score * recency_boost) + phrase_bonus + path_bonus + section_bonus + category_bonus
                 results.append((doc_id, final))
 
             results.sort(key=lambda x: x[1], reverse=True)
@@ -486,7 +653,7 @@ class MemoryRetriever:
                 doc = self._docs[doc_id]
                 category = doc.get("category") or (doc.get("meta") or {}).get("category") or "project_fact"
                 reason = _match_reason(
-                    qtokens,
+                    query_features,
                     doc.get("text") or "",
                     doc.get("summary_sections") if isinstance(doc.get("summary_sections"), dict) else None,
                     category,

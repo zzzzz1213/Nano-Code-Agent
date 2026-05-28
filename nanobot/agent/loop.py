@@ -149,6 +149,12 @@ class AgentLoop:
     _PENDING_USER_TURN_KEY = "pending_user_turn"
     _CHECKPOINT_SHELL_TOOL_NAMES = frozenset({"exec", "shell"})
     _CHECKPOINT_WRITE_TOOL_NAMES = frozenset({"write_file", "edit_file", "notebook_edit"})
+    _CHECKPOINT_CONFIDENT_MCP_CAPABILITY_SOURCES = frozenset((
+        "annotation",
+        "prompt",
+        "resource",
+        "server_transport",
+    ))
     _CHECKPOINT_MCP_REVIEW_MARKERS = (
         "_write",
         "_edit",
@@ -1780,8 +1786,69 @@ class AgentLoop:
         return None
 
     @classmethod
-    def _checkpoint_tool_is_shell_or_write(cls, name: str) -> bool:
-        return cls._checkpoint_tool_review_kind(name) is not None
+    def _checkpoint_tool_metadata_scopes(cls, metadata: dict[str, Any]) -> set[str]:
+        scopes = metadata.get("scopes")
+        if not isinstance(scopes, (list, tuple, set)):
+            return set()
+        return {
+            str(scope).strip().lower()
+            for scope in scopes
+            if isinstance(scope, str) and scope.strip()
+        }
+
+    @classmethod
+    def _checkpoint_tool_review_kind_from_metadata(
+        cls,
+        name: str,
+        metadata: dict[str, Any],
+    ) -> str | None:
+        explicit = cls._checkpoint_tool_review_kind(name)
+        if explicit is not None:
+            return explicit
+
+        config_key = metadata.get("config_key")
+        normalized_config = config_key.strip().lower() if isinstance(config_key, str) else ""
+        scopes = cls._checkpoint_tool_metadata_scopes(metadata)
+        if normalized_config == "exec" or {"exec", "shell"} & scopes:
+            return "shell"
+
+        if normalized_config == "mcp":
+            if metadata.get("exclusive") is True or metadata.get("read_only") is not True:
+                if str(metadata.get("mcp_origin") or "").strip().lower() == "local":
+                    return "mcp_local"
+                return "mcp_mutating"
+            if cls._checkpoint_mcp_requires_review(metadata):
+                return "mcp_local"
+
+        if metadata.get("exclusive") is True:
+            return "exclusive"
+        if metadata.get("read_only") is not True:
+            return "mutating"
+        if metadata.get("concurrency_safe") is not True:
+            return "concurrency_review"
+        return None
+
+    @classmethod
+    def _checkpoint_mcp_requires_review(cls, metadata: dict[str, Any]) -> bool:
+        config_key = metadata.get("config_key")
+        if not isinstance(config_key, str) or config_key.strip().lower() != "mcp":
+            return False
+        if metadata.get("read_only") is not True:
+            return True
+        if metadata.get("exclusive") is True or metadata.get("concurrency_safe") is not True:
+            return True
+        origin = str(metadata.get("mcp_origin") or "").strip().lower()
+        if origin != "local":
+            return False
+        source = str(metadata.get("mcp_capability_source") or "").strip().lower()
+        return bool(source) and source not in cls._CHECKPOINT_CONFIDENT_MCP_CAPABILITY_SOURCES
+
+    @classmethod
+    def _checkpoint_tool_is_shell_or_write(cls, name: str, metadata: dict[str, Any] | None = None) -> bool:
+        return cls._checkpoint_tool_review_kind_from_metadata(name, metadata or {}) in {
+            "shell",
+            "write",
+        }
 
     def _checkpoint_tool_metadata(self, name: str) -> dict[str, Any]:
         tools = getattr(self, "tools", None)
@@ -1803,9 +1870,13 @@ class AgentLoop:
         if recovery_strategy == "requires_user":
             return False
         name = self._checkpoint_tool_name(tool_call)
-        if not name or self._checkpoint_tool_is_shell_or_write(name):
+        if not name:
             return False
         metadata = self._checkpoint_tool_metadata(name)
+        if self._checkpoint_tool_is_shell_or_write(name, metadata):
+            return False
+        if self._checkpoint_mcp_requires_review(metadata):
+            return False
         return (
             metadata.get("read_only") is True
             and metadata.get("concurrency_safe") is True
@@ -1848,13 +1919,17 @@ class AgentLoop:
                 continue
             name = self._checkpoint_tool_name(tool_call) or "tool"
             recovery_strategy = self._checkpoint_tool_recovery_strategy(tool_call)
+            metadata = self._checkpoint_tool_metadata(name)
             resumable = self._checkpoint_tool_is_resumable(tool_call, recovery_strategy)
+            review_kind = self._checkpoint_tool_review_kind_from_metadata(name, metadata)
             group = self._checkpoint_recovery_review_group(
                 name,
                 tool_call,
                 recovery_strategy,
+                metadata=metadata,
                 resumable=resumable,
             )
+            review_state = self._checkpoint_recovery_review_state(tool_call, group)
             groups[group].append(tool_id)
             items.append({
                 "tool_call_id": tool_id,
@@ -1865,8 +1940,40 @@ class AgentLoop:
                     tool_call,
                     recovery_strategy,
                     group,
+                    metadata=metadata,
                 ),
                 "recovery_action": self._checkpoint_recovery_review_action(group),
+                "action_label": self._checkpoint_recovery_review_action_label(group),
+                "review_kind": review_kind
+                or self._checkpoint_recovery_review_kind_for_group(group, metadata=metadata),
+                "summary": self._checkpoint_recovery_review_summary(
+                    name,
+                    tool_call,
+                    group,
+                ),
+                "config_key": metadata.get("config_key"),
+                "scope": self._checkpoint_recovery_review_scope(metadata),
+                "can_resume_now": group == "safe_resume",
+                "can_retry_now": self._checkpoint_recovery_review_can_retry_now(
+                    tool_call,
+                    group,
+                ),
+                "review_state": review_state,
+                "status_label": self._checkpoint_recovery_review_status_label(
+                    tool_call,
+                    group,
+                    review_state=review_state,
+                ),
+                "input_required": self._checkpoint_recovery_review_input_required(
+                    tool_call,
+                    group,
+                ),
+                "input_placeholder": self._checkpoint_recovery_review_input_placeholder(
+                    name,
+                    tool_call,
+                    group,
+                ),
+                "review_confirmed": tool_call.get("review_confirmed") is True,
             })
 
         return {
@@ -1888,6 +1995,7 @@ class AgentLoop:
         tool_call: dict[str, Any],
         recovery_strategy: str,
         *,
+        metadata: dict[str, Any],
         resumable: bool,
     ) -> str:
         if resumable:
@@ -1897,22 +2005,25 @@ class AgentLoop:
             return "blocked"
         if recovery_strategy == "requires_user":
             return "needs_input"
-        if self._checkpoint_tool_review_kind(name) is not None:
+        if self._checkpoint_tool_review_kind_from_metadata(name, metadata) is not None:
             return "review_required"
-        metadata = self._checkpoint_tool_metadata(name)
         if metadata.get("exclusive") is True or metadata.get("read_only") is not True:
             return "review_required"
         if recovery_strategy == "retryable":
             return "review_required"
         return "review_required"
 
-    @staticmethod
+    @classmethod
     def _checkpoint_recovery_review_reason(
+        cls,
         name: str,
         tool_call: dict[str, Any],
         recovery_strategy: str,
         group: str,
+        *,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
+        metadata = metadata or {}
         failure_category = tool_call.get("failure_category")
         if isinstance(failure_category, str) and failure_category:
             return failure_category
@@ -1922,13 +2033,21 @@ class AgentLoop:
             return "blocked_by_safety_policy"
         if group == "needs_input":
             return "requires_user_input"
-        review_kind = AgentLoop._checkpoint_tool_review_kind(name)
+        review_kind = cls._checkpoint_tool_review_kind_from_metadata(name, metadata)
         if review_kind == "shell":
             return "shell_command_requires_review"
         if review_kind == "write":
             return "write_tool_requires_review"
+        if review_kind == "mcp_local":
+            return "mcp_local_tool_requires_review"
         if review_kind == "mcp_mutating":
             return "mcp_mutating_tool_requires_review"
+        if review_kind == "exclusive":
+            return "exclusive_tool_requires_review"
+        if review_kind == "mutating":
+            return "non_read_only_tool_requires_review"
+        if review_kind == "concurrency_review":
+            return "non_concurrency_safe_tool_requires_review"
         if recovery_strategy == "retryable":
             return "retryable_requires_review"
         return "pending_tool_requires_review"
@@ -1942,6 +2061,150 @@ class AgentLoop:
         if group == "blocked":
             return "revise_request"
         return "review_before_retry"
+
+    @staticmethod
+    def _checkpoint_recovery_review_action_label(group: str) -> str:
+        if group == "safe_resume":
+            return "Resume safe tools"
+        if group == "needs_input":
+            return "Collect input"
+        if group == "blocked":
+            return "Revise request"
+        return "Review before retry"
+
+    @staticmethod
+    def _checkpoint_recovery_review_scope(metadata: dict[str, Any]) -> str | None:
+        config_key = metadata.get("config_key")
+        if isinstance(config_key, str):
+            return config_key
+        scopes = metadata.get("scopes")
+        if isinstance(scopes, (list, tuple)):
+            for scope in scopes:
+                if isinstance(scope, str) and scope:
+                    return scope
+        return None
+
+    @staticmethod
+    def _checkpoint_recovery_review_kind_for_group(
+        group: str,
+        *,
+        metadata: dict[str, Any],
+    ) -> str:
+        if group == "safe_resume":
+            return "read_only"
+        if group == "needs_input":
+            return "needs_input"
+        if group == "blocked":
+            return "blocked"
+        if metadata.get("config_key") == "mcp" and AgentLoop._checkpoint_mcp_requires_review(metadata):
+            return "mcp_local"
+        if metadata.get("exclusive") is True:
+            return "exclusive"
+        if metadata.get("read_only") is True:
+            return "retryable"
+        return "mutating"
+
+    @classmethod
+    def _checkpoint_recovery_review_state(
+        cls,
+        tool_call: dict[str, Any],
+        group: str,
+    ) -> str:
+        raw_state = tool_call.get("review_state")
+        if isinstance(raw_state, str) and raw_state:
+            return raw_state
+        if group == "safe_resume":
+            return "ready_to_resume"
+        if group == "blocked":
+            return "blocked"
+        if group == "needs_input":
+            return "awaiting_input"
+        return "awaiting_review"
+
+    @classmethod
+    def _checkpoint_recovery_review_status_label(
+        cls,
+        tool_call: dict[str, Any],
+        group: str,
+        *,
+        review_state: str,
+    ) -> str:
+        if review_state == "confirmed":
+            return "Retry confirmed"
+        if review_state == "input_provided":
+            return "Input collected"
+        if review_state == "ready_to_resume":
+            return "Ready to resume"
+        if review_state == "blocked":
+            return "Blocked by safety policy"
+        if group == "needs_input":
+            return "Waiting for input"
+        if group == "review_required":
+            return "Waiting for confirmation"
+        return "Pending action"
+
+    @staticmethod
+    def _checkpoint_recovery_review_can_retry_now(
+        tool_call: dict[str, Any],
+        group: str,
+    ) -> bool:
+        if group == "safe_resume":
+            return True
+        review_state = tool_call.get("review_state")
+        return isinstance(review_state, str) and review_state in {
+            "confirmed",
+            "input_provided",
+        }
+
+    @staticmethod
+    def _checkpoint_recovery_review_input_required(
+        tool_call: dict[str, Any],
+        group: str,
+    ) -> bool:
+        if group == "needs_input":
+            return True
+        return tool_call.get("needs_user_input") is True
+
+    @classmethod
+    def _checkpoint_recovery_review_input_placeholder(
+        cls,
+        name: str,
+        tool_call: dict[str, Any],
+        group: str,
+    ) -> str | None:
+        if group != "needs_input":
+            return None
+        arguments = cls._checkpoint_tool_arguments(tool_call)
+        if "query" in arguments:
+            return "Provide the missing query details"
+        if "prompt" in arguments:
+            return "Provide the missing prompt details"
+        if "command" in arguments:
+            return "Provide the missing command details"
+        return f"Provide missing input for {name}"
+
+    @classmethod
+    def _checkpoint_recovery_review_summary(
+        cls,
+        name: str,
+        tool_call: dict[str, Any],
+        group: str,
+    ) -> str:
+        arguments = cls._checkpoint_tool_arguments(tool_call)
+        for key in ("path", "file_path", "target_path", "cwd", "url", "query", "pattern"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{key}: {truncate_text_fn(value.strip(), 80)}"
+        if "command" in arguments:
+            return "command available during review"
+        if "prompt" in arguments:
+            return "prompt provided"
+        if arguments:
+            keys = ", ".join(sorted(str(key) for key in arguments.keys())[:4])
+            return f"args: {truncate_text_fn(keys, 80)}"
+        if group == "safe_resume":
+            return "read-only candidate ready to resume"
+        return f"tool: {name}"
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:
         """Materialize an unfinished turn into session history before a new request."""
@@ -2224,6 +2487,103 @@ class AgentLoop:
         if sessions is not None:
             sessions.save(session)
         return resumed_checkpoint
+
+    async def _apply_recovery_review_action(
+        self,
+        session: Session,
+        *,
+        tool_call_id: str,
+        action: str,
+        user_input: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply a UI recovery-review action to the latest preserved checkpoint."""
+        checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+        if not isinstance(checkpoint, dict):
+            return None
+        if session.metadata.get(self._RUNTIME_CHECKPOINT_MATERIALIZED_KEY) is not True:
+            if not self._restore_runtime_checkpoint(session):
+                return None
+            checkpoint = session.metadata.get(self._RUNTIME_CHECKPOINT_KEY)
+            if not isinstance(checkpoint, dict):
+                return None
+
+        pending_tool_calls = [
+            dict(tool_call)
+            for tool_call in checkpoint.get("pending_tool_calls") or []
+            if isinstance(tool_call, dict)
+        ]
+        if not pending_tool_calls:
+            return None
+
+        target_index: int | None = None
+        target_tool_call: dict[str, Any] | None = None
+        for index, tool_call in enumerate(pending_tool_calls):
+            if self._checkpoint_tool_call_id(tool_call) == tool_call_id:
+                target_index = index
+                target_tool_call = tool_call
+                break
+        if target_index is None or target_tool_call is None:
+            return None
+
+        target_name = self._checkpoint_tool_name(target_tool_call) or "tool"
+        target_metadata = self._checkpoint_tool_metadata(target_name)
+        group = self._checkpoint_recovery_review_group(
+            target_name,
+            target_tool_call,
+            self._checkpoint_tool_recovery_strategy(target_tool_call),
+            metadata=target_metadata,
+            resumable=self._checkpoint_tool_is_resumable(
+                target_tool_call,
+                self._checkpoint_tool_recovery_strategy(target_tool_call),
+            ),
+        )
+        normalized_action = action.strip().lower()
+        if group == "review_required" and normalized_action != "confirm_retry":
+            return None
+        if group == "needs_input" and normalized_action != "provide_input":
+            return None
+        if group not in {"review_required", "needs_input"}:
+            return None
+
+        updated_tool_call = dict(target_tool_call)
+        review_state = "confirmed" if group == "review_required" else "input_provided"
+        updated_tool_call["review_state"] = review_state
+        updated_tool_call["review_confirmed"] = True
+        updated_tool_call["review_updated_at"] = time.time()
+        if group == "review_required":
+            updated_tool_call["retryable"] = True
+            updated_tool_call["recovery_action"] = "retry"
+            updated_tool_call["needs_user_input"] = False
+            updated_tool_call["last_review_action"] = "confirm_retry"
+        else:
+            cleaned_input = (user_input or "").strip()
+            if not cleaned_input:
+                return None
+            updated_tool_call["provided_user_input"] = cleaned_input
+            updated_tool_call["needs_user_input"] = False
+            updated_tool_call["recovery_action"] = "retry"
+            updated_tool_call["retryable"] = True
+            updated_tool_call["last_review_action"] = "provide_input"
+
+        pending_tool_calls[target_index] = updated_tool_call
+        updated_checkpoint = {
+            **checkpoint,
+            "pending_tool_calls": pending_tool_calls,
+            "pending_tool_count": len(pending_tool_calls),
+        }
+        updated_checkpoint.update(
+            self._checkpoint_recovery_review(
+                pending_tool_calls,
+                include_ids={
+                    self._checkpoint_tool_call_id(tool_call)
+                    for tool_call in pending_tool_calls
+                    if self._checkpoint_tool_call_id(tool_call)
+                },
+            )
+        )
+        self._remember_restored_runtime_checkpoint(session, updated_checkpoint)
+        self.sessions.save(session)
+        return updated_checkpoint
 
     def _restore_pending_user_turn(self, session: Session) -> bool:
         """Close a turn that only persisted the user message before crashing."""

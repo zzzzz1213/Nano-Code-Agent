@@ -47,6 +47,16 @@ class _InvalidNameTool(_FakeTool):
         return "bad tool name"
 
 
+class _ConflictingCapabilityTool(_FakeTool):
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+
 def _tool_names(definitions: list[dict[str, Any]]) -> list[str]:
     names: list[str] = []
     for definition in definitions:
@@ -181,3 +191,14 @@ def test_register_rejects_non_object_parameter_schema() -> None:
         assert "parameters schema must be object type" in str(exc)
     else:
         raise AssertionError("invalid parameter schema should fail registration")
+
+
+def test_register_rejects_conflicting_tool_capabilities() -> None:
+    registry = ToolRegistry()
+
+    try:
+        registry.register(_ConflictingCapabilityTool("bad_capabilities"))
+    except ValueError as exc:
+        assert "read_only and exclusive cannot both be true" in str(exc)
+    else:
+        raise AssertionError("conflicting capabilities should fail registration")

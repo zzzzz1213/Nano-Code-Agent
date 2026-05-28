@@ -1322,12 +1322,75 @@ class AgentRunner:
 
     @staticmethod
     def _tool_recovery_metadata(failure_category: str) -> dict[str, Any]:
+        diagnostics: dict[str, dict[str, Any]] = {
+            "safety_block": {
+                "diagnostic_label": "Policy block",
+                "diagnostic_hint": "Revise the request so it stays within the active safety boundary.",
+                "recommended_action": "Ask the user for a safer alternative or narrower scope.",
+            },
+            "workspace_boundary": {
+                "diagnostic_label": "Workspace boundary",
+                "diagnostic_hint": "The tool tried to access a path outside the allowed workspace.",
+                "recommended_action": "Retry with a workspace-relative path or ask the user to expand access.",
+            },
+            "external_lookup_repeated": {
+                "diagnostic_label": "Use existing context",
+                "diagnostic_hint": "Repeated external lookups were suppressed to keep the turn moving.",
+                "recommended_action": "Answer from existing context or ask the user for a narrower lookup target.",
+            },
+            "tool_prepare_error": {
+                "diagnostic_label": "Invalid arguments",
+                "diagnostic_hint": "The tool call arguments did not match the declared schema.",
+                "recommended_action": "Revise the tool arguments and retry.",
+            },
+            "tool_error_result": {
+                "diagnostic_label": "Tool failed",
+                "diagnostic_hint": "The tool returned an error payload instead of a successful result.",
+                "recommended_action": "Try an alternative tool path or adjust the request.",
+            },
+            "tool_exception": {
+                "diagnostic_label": "Execution error",
+                "diagnostic_hint": "The tool raised an exception before it could return a result.",
+                "recommended_action": "Retry once if the error looks transient, otherwise change approach.",
+            },
+            "mcp_timeout": {
+                "diagnostic_label": "MCP timeout",
+                "diagnostic_hint": "The MCP server did not answer before the tool timeout expired.",
+                "recommended_action": "Retry after checking the MCP server is reachable and not overloaded.",
+            },
+            "mcp_connection_interrupted": {
+                "diagnostic_label": "Connection interrupted",
+                "diagnostic_hint": "The MCP transport disconnected or reset while the tool call was in flight.",
+                "recommended_action": "Reconnect or restart the MCP server, then retry the same request.",
+            },
+            "mcp_protocol_error": {
+                "diagnostic_label": "Protocol error",
+                "diagnostic_hint": "The MCP server returned malformed JSON-RPC or polluted stdout.",
+                "recommended_action": "Check the MCP server logs and ensure protocol output stays on stdout only.",
+            },
+            "mcp_permission_denied": {
+                "diagnostic_label": "Permission denied",
+                "diagnostic_hint": "The MCP server rejected the request because credentials or permissions are missing.",
+                "recommended_action": "Check auth configuration, server policy, or ask the user for approval.",
+            },
+            "mcp_tool_error": {
+                "diagnostic_label": "MCP tool error",
+                "diagnostic_hint": "The MCP tool ran but returned a server-side failure.",
+                "recommended_action": "Retry with narrower input or switch to a different MCP capability.",
+            },
+        }
+        diagnostic = diagnostics.get(failure_category, {
+            "diagnostic_label": "Retry suggested",
+            "diagnostic_hint": "The tool reported a recoverable failure.",
+            "recommended_action": "Retry once or revise the request.",
+        })
         if failure_category == "safety_block":
             return {
                 "failure_category": failure_category,
                 "recovery_action": "revise_request",
                 "retryable": False,
                 "needs_user_input": True,
+                **diagnostic,
             }
         if failure_category == "workspace_boundary":
             return {
@@ -1335,6 +1398,7 @@ class AgentRunner:
                 "recovery_action": "revise_arguments",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "workspace_boundary_escalated":
             return {
@@ -1342,6 +1406,7 @@ class AgentRunner:
                 "recovery_action": "ask_user",
                 "retryable": False,
                 "needs_user_input": True,
+                **diagnostics["workspace_boundary"],
             }
         if failure_category == "external_lookup_repeated":
             return {
@@ -1349,6 +1414,7 @@ class AgentRunner:
                 "recovery_action": "use_existing_context",
                 "retryable": False,
                 "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "tool_prepare_error":
             return {
@@ -1356,6 +1422,7 @@ class AgentRunner:
                 "recovery_action": "revise_arguments",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "tool_error_result":
             return {
@@ -1363,6 +1430,15 @@ class AgentRunner:
                 "recovery_action": "retry_alternative",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
+            }
+        if failure_category == "tool_exception":
+            return {
+                "failure_category": failure_category,
+                "recovery_action": "retry",
+                "retryable": True,
+                "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "mcp_timeout":
             return {
@@ -1370,6 +1446,7 @@ class AgentRunner:
                 "recovery_action": "retry",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "mcp_connection_interrupted":
             return {
@@ -1377,6 +1454,7 @@ class AgentRunner:
                 "recovery_action": "retry",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
             }
         if failure_category == "mcp_protocol_error":
             return {
@@ -1384,6 +1462,7 @@ class AgentRunner:
                 "recovery_action": "revise_request",
                 "retryable": False,
                 "needs_user_input": True,
+                **diagnostic,
             }
         if failure_category == "mcp_permission_denied":
             return {
@@ -1391,6 +1470,7 @@ class AgentRunner:
                 "recovery_action": "ask_user",
                 "retryable": False,
                 "needs_user_input": True,
+                **diagnostic,
             }
         if failure_category == "mcp_tool_error":
             return {
@@ -1398,12 +1478,14 @@ class AgentRunner:
                 "recovery_action": "retry_alternative",
                 "retryable": True,
                 "needs_user_input": False,
+                **diagnostic,
             }
         return {
             "failure_category": failure_category,
             "recovery_action": "retry",
             "retryable": True,
             "needs_user_input": False,
+            **diagnostic,
         }
 
     @staticmethod

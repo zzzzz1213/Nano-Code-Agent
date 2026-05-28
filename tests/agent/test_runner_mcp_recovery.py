@@ -46,6 +46,8 @@ async def test_runner_classifies_mcp_timeout_result() -> None:
     assert event["recovery_action"] == "retry"
     assert event["retryable"] is True
     assert event["needs_user_input"] is False
+    assert event["diagnostic_label"] == "MCP timeout"
+    assert "reachable" in event["recommended_action"]
     assert event["read_only"] is True
     assert event["concurrency_safe"] is True
 
@@ -72,3 +74,13 @@ def test_runner_classifies_mcp_protocol_and_permission_results() -> None:
         )
         is None
     )
+
+
+def test_runner_recovery_metadata_includes_mcp_diagnostics() -> None:
+    protocol = AgentRunner._tool_recovery_metadata("mcp_protocol_error")
+    permission = AgentRunner._tool_recovery_metadata("mcp_permission_denied")
+
+    assert protocol["diagnostic_label"] == "Protocol error"
+    assert "stdout" in protocol["diagnostic_hint"]
+    assert permission["diagnostic_label"] == "Permission denied"
+    assert "auth" in permission["recommended_action"].lower()

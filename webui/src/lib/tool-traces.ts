@@ -78,6 +78,9 @@ export interface ParsedToolTrace {
   recoveryAction?: string;
   retryable?: boolean;
   needsUserInput?: boolean;
+  diagnosticLabel?: string;
+  diagnosticHint?: string;
+  recommendedAction?: string;
   readOnly?: boolean;
   concurrencySafe?: boolean;
   exclusive?: boolean;
@@ -176,6 +179,12 @@ export function parseToolTraceEvent(event: ToolProgressEvent): ParsedToolTrace |
     retryable: typeof event.retryable === "boolean" ? event.retryable : undefined,
     needsUserInput:
       typeof event.needs_user_input === "boolean" ? event.needs_user_input : undefined,
+    diagnosticLabel:
+      typeof event.diagnostic_label === "string" ? event.diagnostic_label : undefined,
+    diagnosticHint:
+      typeof event.diagnostic_hint === "string" ? event.diagnostic_hint : undefined,
+    recommendedAction:
+      typeof event.recommended_action === "string" ? event.recommended_action : undefined,
     readOnly: typeof event.read_only === "boolean" ? event.read_only : undefined,
     concurrencySafe:
       typeof event.concurrency_safe === "boolean" ? event.concurrency_safe : undefined,
@@ -286,6 +295,12 @@ function normalizeToolProgressEvent(event: unknown): ToolProgressEvent | null {
     recovery_action: typeof row.recovery_action === "string" ? row.recovery_action : undefined,
     retryable: typeof row.retryable === "boolean" ? row.retryable : undefined,
     needs_user_input: typeof row.needs_user_input === "boolean" ? row.needs_user_input : undefined,
+    diagnostic_label:
+      typeof row.diagnostic_label === "string" ? row.diagnostic_label : undefined,
+    diagnostic_hint:
+      typeof row.diagnostic_hint === "string" ? row.diagnostic_hint : undefined,
+    recommended_action:
+      typeof row.recommended_action === "string" ? row.recommended_action : undefined,
     read_only: typeof row.read_only === "boolean" ? row.read_only : undefined,
     concurrency_safe: typeof row.concurrency_safe === "boolean" ? row.concurrency_safe : undefined,
     exclusive: typeof row.exclusive === "boolean" ? row.exclusive : undefined,

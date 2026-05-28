@@ -127,6 +127,9 @@ export interface ToolProgressEvent {
   recovery_action?: string;
   retryable?: boolean;
   needs_user_input?: boolean;
+  diagnostic_label?: string;
+  diagnostic_hint?: string;
+  recommended_action?: string;
   read_only?: boolean;
   concurrency_safe?: boolean;
   exclusive?: boolean;
@@ -182,6 +185,18 @@ export interface UITurnCheckpoint {
     group?: "safe_resume" | "review_required" | "needs_input" | "blocked" | string;
     reason?: string;
     recovery_action?: string;
+    action_label?: string;
+    review_kind?: string;
+    summary?: string;
+    config_key?: string;
+    scope?: string;
+    can_resume_now?: boolean;
+    can_retry_now?: boolean;
+    review_state?: string;
+    status_label?: string;
+    input_required?: boolean;
+    input_placeholder?: string | null;
+    review_confirmed?: boolean;
   }>;
   recovery_review_count?: number;
   skipped_duplicate_tool_call_ids?: string[];
@@ -286,14 +301,31 @@ export interface UIMemoryCandidate {
   assistant_preview?: string;
   sensitive?: boolean;
   duplicate?: boolean;
+  existing_preview?: string;
+  merge_action?: string;
+  merge_reason?: string;
+  conflict_reason?: string;
+  merged_content?: string;
+  merge_score?: number;
   created_at?: string;
+}
+
+export interface RecoveryActionResult {
+  ok: boolean;
+  checkpoint?: UITurnCheckpoint;
 }
 
 export interface MemoryCandidateCommitResult {
   committed: boolean;
   duplicate?: boolean;
+  merged?: boolean;
+  conflict?: boolean;
   duplicate_reason?: string;
   existing_preview?: string;
+  merge_action?: string;
+  merge_reason?: string;
+  conflict_reason?: string;
+  merged_content?: string;
   target?: string;
   candidate?: UIMemoryCandidate;
 }

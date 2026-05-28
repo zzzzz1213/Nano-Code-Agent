@@ -10,8 +10,7 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nanobot.agent.memory import MemoryStore
-from nanobot.agent.memory import retriever
+from nanobot.agent.memory import MemoryStore, retriever
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.utils.helpers import (
@@ -106,7 +105,7 @@ class ContextBuilder:
                 sections = meta.get("sections") if isinstance(meta.get("sections"), dict) else None
                 if sections:
                     lines: list[str] = []
-                    order = ["overview", "goal", "constraints", "files_touched", "commands_run", "failures", "decisions", "next_steps"]
+                    order = ["goal", "constraints", "decisions", "failures", "files_touched", "commands_run", "next_steps", "overview"]
                     labels = {
                         "overview": "Overview",
                         "goal": "Goal",
@@ -294,10 +293,10 @@ class ContextBuilder:
             chunks.append(session_text.strip())
         request_signals = cls._extract_retrieval_signals(current_message)
         if request_signals:
-            chunks.append("Current request signals:\n" + request_signals)
+            chunks.append(request_signals)
         history_signals = cls._recent_history_retrieval_signals(recent_history)
         if history_signals:
-            chunks.append("Recent history signals:\n" + history_signals)
+            chunks.append(history_signals)
         return truncate_text("\n\n".join(chunks), cls._MAX_RETRIEVAL_QUERY_CHARS).strip()
 
     @classmethod
@@ -320,14 +319,25 @@ class ContextBuilder:
         content = cls._message_content_text(text)
         if not content.strip():
             return ""
-        lines: list[str] = []
-        lines.extend(cls._RETRIEVAL_FILE_RE.findall(content))
+        path_lines: list[str] = []
+        signal_lines: list[str] = []
+        fallback_lines: list[str] = []
+        path_lines.extend(cls._RETRIEVAL_FILE_RE.findall(content))
         for raw_line in content.splitlines():
             line = re.sub(r"\s+", " ", raw_line).strip()
             if not line:
                 continue
-            if cls._RETRIEVAL_SIGNAL_RE.search(line) or cls._RETRIEVAL_FILE_RE.search(line):
-                lines.append(truncate_text(line, 220))
+            truncated = truncate_text(line, 220)
+            if cls._RETRIEVAL_FILE_RE.search(line):
+                path_lines.append(truncated)
+                continue
+            if cls._RETRIEVAL_SIGNAL_RE.search(line):
+                signal_lines.append(truncated)
+                continue
+            fallback_lines.append(truncate_text(re.sub(r"\s+", " ", line).strip(), 160))
+        lines = [*path_lines, *signal_lines]
+        if not lines and fallback_lines:
+            lines.extend(fallback_lines)
         if not lines:
             lines.append(truncate_text(re.sub(r"\s+", " ", content).strip(), 360))
         return cls._dedupe_lines(lines, limit=16)

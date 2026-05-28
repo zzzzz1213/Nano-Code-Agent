@@ -40,7 +40,7 @@ import {
   ReasoningBubble,
   StreamingLabelSheen,
 } from "@/components/MessageBubble";
-import { commitMemoryCandidate, recoverMemory } from "@/lib/api";
+import { applyRecoveryAction, commitMemoryCandidate, recoverMemory } from "@/lib/api";
 import {
   compactToolTraceLabel,
   parseToolTraceEvent,
@@ -142,6 +142,51 @@ interface TurnSnapshot {
   blockedToolCount: number;
   recoveryReviewItems: RecoveryReviewItem[];
   source: SnapshotSource;
+  taskPlanItems: TaskPlanItem[];
+  checkSummary: WorkbenchCheckSummary;
+  diffPreview: WorkbenchDiffPreview;
+  turnSummary: WorkbenchTurnSummary;
+}
+
+interface TaskPlanItem {
+  key: string;
+  label: string;
+  detail: string;
+  status: ActivityPhaseStatus;
+  anchorId?: string;
+  actionLabel?: string;
+}
+
+interface WorkbenchCheckSummary {
+  total: number;
+  running: number;
+  passed: number;
+  failed: number;
+  primaryCommand?: string;
+  failureSummary?: string;
+  failureCategory?: string;
+  diagnosticLabel?: string;
+  diagnosticHint?: string;
+  recommendedAction?: string;
+  relatedTarget?: string;
+}
+
+interface WorkbenchDiffPreview {
+  total: number;
+  items: FileEditSummary[];
+  binaryCount: number;
+  approximateCount: number;
+  failedCount: number;
+  largeChangeCount: number;
+}
+
+interface WorkbenchTurnSummary {
+  modifiedSummary: string;
+  checksSummary: string;
+  riskSummary: string;
+  nextStep: string;
+  nextStepAnchorId?: string;
+  nextStepActionLabel?: string;
 }
 
 type RecoveryReviewGroup =
@@ -157,7 +202,26 @@ interface RecoveryReviewItem {
   group: RecoveryReviewGroup;
   reason?: string;
   recoveryAction?: string;
+  actionLabel?: string;
+  reviewKind?: string;
+  summary?: string;
+  configKey?: string;
+  scope?: string;
+  canResumeNow?: boolean;
+  canRetryNow?: boolean;
+  reviewState?: string;
+  statusLabel?: string;
+  inputRequired?: boolean;
+  inputPlaceholder?: string | null;
+  reviewConfirmed?: boolean;
 }
+
+interface RecoveryReviewLocalState {
+  reviewState: string;
+  statusLabel: string;
+}
+
+const LARGE_DIFF_LINE_THRESHOLD = 200;
 
 interface ToolSchedulingSummary {
   queued: number;
@@ -225,6 +289,8 @@ interface AgentActivityClusterProps {
   /** True while the session turn is still running (drives “Working…” copy + header sheen). */
   isTurnStreaming: boolean;
   hasBodyBelow: boolean;
+  sessionKey?: string | null;
+  onResumeSafeTools?: () => void;
 }
 
 /**
@@ -235,6 +301,8 @@ export function AgentActivityCluster({
   messages,
   isTurnStreaming,
   hasBodyBelow,
+  sessionKey = null,
+  onResumeSafeTools,
 }: AgentActivityClusterProps) {
   const { t } = useTranslation();
   const fileEdits = useMemo(
@@ -613,9 +681,13 @@ export function AgentActivityCluster({
               {memoryCandidates.length ? (
                 <MemoryCandidateGroup candidates={memoryCandidates} />
               ) : null}
-              {turnSnapshot ? (
-                <TurnSnapshotPanel snapshot={turnSnapshot} />
-              ) : null}
+                {turnSnapshot ? (
+                  <TurnSnapshotPanel
+                    snapshot={turnSnapshot}
+                    sessionKey={sessionKey}
+                    onResumeSafeTools={onResumeSafeTools}
+                  />
+                ) : null}
               {messages.map((m) => {
                 if (isReasoningOnlyAssistant(m)) {
                   return (
@@ -1071,6 +1143,22 @@ function buildTurnSnapshot({
     activityPhases.some((phase) => phase.status === "failed") ||
     fileEdits.some((edit) => edit.status === "error");
   const source = snapshotSource(checkpoint, isTurnStreaming);
+  const toolCount = finiteCount(checkpoint?.tool_call_count, toolTraces.length);
+  const fileCount = Math.max(
+    finiteCount(checkpoint?.file_edit_count, fileEdits.length),
+    fileEdits.length,
+  );
+  const recoveryReviewItems = normalizeRecoveryReviewItems(
+    checkpoint?.recovery_review_items,
+  );
+  const checkSummary = buildWorkbenchCheckSummary({
+    toolTraces,
+    checkState,
+    failedCheckCount,
+    passedCheckCount,
+    runningCheckCount,
+  });
+  const diffPreview = buildWorkbenchDiffPreview(fileEdits);
   return {
     phaseLabel: checkpoint
       ? checkpointPhaseLabel(checkpoint.phase)
@@ -1079,11 +1167,8 @@ function buildTurnSnapshot({
       ? checkpointPhaseDetail(checkpoint.phase)
       : fallbackPhase.detail,
     status: checkpointStatus ?? fallbackPhase.status,
-    toolCount: finiteCount(checkpoint?.tool_call_count, toolTraces.length),
-    fileCount: Math.max(
-      finiteCount(checkpoint?.file_edit_count, fileEdits.length),
-      fileEdits.length,
-    ),
+    toolCount,
+    fileCount,
     added,
     deleted,
     checkState,
@@ -1102,10 +1187,253 @@ function buildTurnSnapshot({
     ),
     needsInputToolCount: finiteCount(checkpoint?.needs_input_tool_count, 0),
     blockedToolCount: finiteCount(checkpoint?.blocked_tool_count, 0),
-    recoveryReviewItems: normalizeRecoveryReviewItems(
-      checkpoint?.recovery_review_items,
-    ),
+    recoveryReviewItems,
     source,
+    taskPlanItems: buildTaskPlanItems({
+      activityPhases,
+      currentPhase: checkpointStatus ? undefined : currentPhase,
+      hasFailures,
+      recoveryReviewItems,
+      checkState,
+    }),
+    checkSummary,
+    diffPreview,
+    turnSummary: buildWorkbenchTurnSummary({
+      toolCount,
+      fileCount,
+      added,
+      deleted,
+      checkState,
+      checkSummary,
+      diffPreview,
+      hasFailures,
+      recoverable: source !== "live",
+      safeResumeToolCount: finiteCount(checkpoint?.safe_resume_tool_count, 0),
+      reviewRequiredToolCount: finiteCount(
+        checkpoint?.review_required_tool_count,
+        0,
+      ),
+      needsInputToolCount: finiteCount(checkpoint?.needs_input_tool_count, 0),
+      blockedToolCount: finiteCount(checkpoint?.blocked_tool_count, 0),
+      resumableToolCount: finiteCount(checkpoint?.resumable_tool_count, 0),
+      phaseLabel: checkpoint
+        ? checkpointPhaseLabel(checkpoint.phase)
+        : fallbackPhase.label,
+    }),
+  };
+}
+
+function buildTaskPlanItems({
+  activityPhases,
+  currentPhase,
+  hasFailures,
+  recoveryReviewItems,
+  checkState,
+}: {
+  activityPhases: ActivityPhase[];
+  currentPhase?: ActivityPhase;
+  hasFailures: boolean;
+  recoveryReviewItems: RecoveryReviewItem[];
+  checkState: SnapshotCheckState;
+}): TaskPlanItem[] {
+  const items: TaskPlanItem[] = activityPhases.map((phase) => ({
+    key: phase.id,
+    label: phase.label,
+    detail: phase.detail,
+    status:
+      currentPhase && currentPhase.id === phase.id
+        ? currentPhase.status
+        : phase.status,
+  }));
+  if (recoveryReviewItems.length > 0) {
+    items.push({
+      key: "recovery-review",
+      label: "Review recovery actions",
+      detail: `${recoveryReviewItems.length} pending item${recoveryReviewItems.length === 1 ? "" : "s"}`,
+      status: "pending",
+      anchorId: "recovery-review",
+      actionLabel: "Open review",
+    });
+  } else if (hasFailures && checkState === "failed") {
+    items.push({
+      key: "fix-checks",
+      label: "Resolve failing checks",
+      detail: "Inspect the latest failed command before continuing.",
+      status: "pending",
+      anchorId: "check-results",
+      actionLabel: "Open checks",
+    });
+  }
+  return items;
+}
+
+function buildWorkbenchCheckSummary({
+  toolTraces,
+  checkState,
+  failedCheckCount,
+  passedCheckCount,
+  runningCheckCount,
+}: {
+  toolTraces: ParsedToolTrace[];
+  checkState: SnapshotCheckState;
+  failedCheckCount: number;
+  passedCheckCount: number;
+  runningCheckCount: number;
+}): WorkbenchCheckSummary {
+  const checkTraces = toolTraces.filter((trace) => trace.category === "check");
+  const failingTrace = [...checkTraces]
+    .reverse()
+    .find((trace) => trace.status === "failed");
+  const activeTrace = [...checkTraces]
+    .reverse()
+    .find((trace) => trace.status === "running" || trace.status === "passed");
+  return {
+    total: checkTraces.length,
+    running: checkState === "running" ? Math.max(1, runningCheckCount || checkTraces.filter((trace) => trace.status === "running").length) : runningCheckCount,
+    passed: checkState === "passed" ? Math.max(1, passedCheckCount || checkTraces.filter((trace) => trace.status === "passed").length) : passedCheckCount,
+    failed: checkState === "failed" ? Math.max(1, failedCheckCount || checkTraces.filter((trace) => trace.status === "failed").length) : failedCheckCount,
+    primaryCommand:
+      failingTrace?.command ??
+      activeTrace?.command ??
+      checkTraces.at(-1)?.command,
+    failureSummary:
+      failingTrace?.summary ??
+      (checkState === "failed" ? "Check failed; inspect the latest command output." : undefined),
+    failureCategory: failingTrace?.failureCategory,
+    diagnosticLabel: failingTrace?.diagnosticLabel,
+    diagnosticHint: failingTrace?.diagnosticHint,
+    recommendedAction: failingTrace?.recommendedAction,
+    relatedTarget: failingTrace?.target,
+  };
+}
+
+function buildWorkbenchDiffPreview(
+  fileEdits: FileEditSummary[],
+): WorkbenchDiffPreview {
+  return {
+    total: fileEdits.length,
+    items: fileEdits.slice(0, 4),
+    binaryCount: fileEdits.filter((edit) => edit.binary).length,
+    approximateCount: fileEdits.filter((edit) => edit.approximate).length,
+    failedCount: fileEdits.filter((edit) => edit.status === "error").length,
+    largeChangeCount: fileEdits.filter(
+      (edit) => edit.added + edit.deleted >= LARGE_DIFF_LINE_THRESHOLD,
+    ).length,
+  };
+}
+
+function buildWorkbenchTurnSummary({
+  toolCount,
+  fileCount,
+  added,
+  deleted,
+  checkState,
+  checkSummary,
+  diffPreview,
+  hasFailures,
+  recoverable,
+  safeResumeToolCount,
+  reviewRequiredToolCount,
+  needsInputToolCount,
+  blockedToolCount,
+  resumableToolCount,
+  phaseLabel,
+}: {
+  toolCount: number;
+  fileCount: number;
+  added: number;
+  deleted: number;
+  checkState: SnapshotCheckState;
+  checkSummary: WorkbenchCheckSummary;
+  diffPreview: WorkbenchDiffPreview;
+  hasFailures: boolean;
+  recoverable: boolean;
+  safeResumeToolCount: number;
+  reviewRequiredToolCount: number;
+  needsInputToolCount: number;
+  blockedToolCount: number;
+  resumableToolCount: number;
+  phaseLabel: string;
+}): WorkbenchTurnSummary {
+  const modifiedSummary =
+    fileCount > 0
+      ? `Edited ${fileCount} file${fileCount === 1 ? "" : "s"} (+${added} -${deleted}).`
+      : toolCount > 0
+        ? `Used ${toolCount} tool call${toolCount === 1 ? "" : "s"} in ${phaseLabel.toLowerCase()}.`
+        : "No file changes or tool calls recorded yet.";
+  const checksSummary =
+    checkState === "failed"
+      ? `${Math.max(1, checkSummary.failed)} failed check${checkSummary.failed === 1 ? "" : "s"}${checkSummary.primaryCommand ? ` · ${checkSummary.primaryCommand}` : ""}.`
+      : checkState === "running"
+        ? `${Math.max(1, checkSummary.running)} check${checkSummary.running === 1 ? "" : "s"} still running.`
+        : checkState === "passed"
+          ? `${Math.max(1, checkSummary.passed)} passed check${checkSummary.passed === 1 ? "" : "s"} recorded.`
+          : "No checks captured in this turn.";
+  const riskSummary =
+    blockedToolCount > 0
+      ? `${blockedToolCount} blocked action${blockedToolCount === 1 ? "" : "s"} still need a safer request before recovery can continue.`
+      : needsInputToolCount > 0
+        ? `${needsInputToolCount} tool${needsInputToolCount === 1 ? "" : "s"} still need extra user input.`
+        : reviewRequiredToolCount > 0
+          ? `${reviewRequiredToolCount} tool${reviewRequiredToolCount === 1 ? "" : "s"} need confirmation before retry.`
+          : hasFailures && checkState === "failed"
+            ? "A failed check still blocks the turn."
+            : diffPreview.failedCount > 0
+              ? `${diffPreview.failedCount} file edit${diffPreview.failedCount === 1 ? "" : "s"} did not finish cleanly.`
+              : recoverable && resumableToolCount > 0
+                ? `${resumableToolCount} tool${resumableToolCount === 1 ? "" : "s"} can resume from the recovered checkpoint.`
+                : recoverable && safeResumeToolCount > 0
+                  ? `${safeResumeToolCount} safe tool${safeResumeToolCount === 1 ? "" : "s"} can resume without rerunning the turn.`
+                  : hasFailures
+                    ? "One or more steps need attention before closing the turn."
+                    : "No blocking risk detected.";
+  let nextStep = "Review the latest output and continue if needed.";
+  let nextStepAnchorId: string | undefined;
+  let nextStepActionLabel: string | undefined;
+  if (blockedToolCount > 0) {
+    nextStep =
+      "Open Recovery review and revise the blocked request before retrying.";
+    nextStepAnchorId = "recovery-review";
+    nextStepActionLabel = "Open review";
+  } else if (needsInputToolCount > 0) {
+    nextStep =
+      "Open Recovery review and provide the missing input before retrying tools.";
+    nextStepAnchorId = "recovery-review";
+    nextStepActionLabel = "Open review";
+  } else if (reviewRequiredToolCount > 0) {
+    nextStep =
+      "Open Recovery review and confirm the pending tool retries.";
+    nextStepAnchorId = "recovery-review";
+    nextStepActionLabel = "Open review";
+  } else if (checkState === "failed") {
+    nextStep = "Inspect the failing check summary and rerun the focused command.";
+    nextStepAnchorId = "check-results";
+    nextStepActionLabel = "Open checks";
+  } else if (recoverable && safeResumeToolCount > 0) {
+    nextStep = "Resume safe tools or review the remaining recovery items.";
+    nextStepAnchorId = "recovery-review";
+    nextStepActionLabel = "Open review";
+  } else if (recoverable && resumableToolCount > 0) {
+    nextStep = "Review the recoverable tools and continue the restored turn.";
+    nextStepAnchorId = "recovery-review";
+    nextStepActionLabel = "Open review";
+  } else if (diffPreview.total > 0) {
+    nextStep =
+      diffPreview.binaryCount > 0 || diffPreview.largeChangeCount > 0
+        ? "Inspect the diff preview for binary or high-volume changes before closing the turn."
+        : "Inspect the diff preview before closing the turn.";
+    nextStepAnchorId = "diff-preview";
+    nextStepActionLabel = "Open diff";
+  } else if (!hasFailures) {
+    nextStep = "Review the completed changes or move to the next task.";
+  }
+  return {
+    modifiedSummary,
+    checksSummary,
+    riskSummary,
+    nextStep,
+    nextStepAnchorId,
+    nextStepActionLabel,
   };
 }
 
@@ -1139,6 +1467,42 @@ function normalizeRecoveryReviewItems(value: unknown): RecoveryReviewItem[] {
         record.recovery_action.trim()
           ? record.recovery_action.trim()
           : undefined,
+      actionLabel:
+        typeof record.action_label === "string" && record.action_label.trim()
+          ? record.action_label.trim()
+          : undefined,
+      reviewKind:
+        typeof record.review_kind === "string" && record.review_kind.trim()
+          ? record.review_kind.trim()
+          : undefined,
+      summary:
+        typeof record.summary === "string" && record.summary.trim()
+          ? record.summary.trim()
+          : undefined,
+      configKey:
+        typeof record.config_key === "string" && record.config_key.trim()
+          ? record.config_key.trim()
+          : undefined,
+      scope:
+        typeof record.scope === "string" && record.scope.trim()
+          ? record.scope.trim()
+          : undefined,
+      canResumeNow: record.can_resume_now === true,
+      canRetryNow: record.can_retry_now === true,
+      reviewState:
+        typeof record.review_state === "string" && record.review_state.trim()
+          ? record.review_state.trim()
+          : undefined,
+      statusLabel:
+        typeof record.status_label === "string" && record.status_label.trim()
+          ? record.status_label.trim()
+          : undefined,
+      inputRequired: record.input_required === true,
+      inputPlaceholder:
+        typeof record.input_placeholder === "string" && record.input_placeholder.trim()
+          ? record.input_placeholder.trim()
+          : undefined,
+      reviewConfirmed: record.review_confirmed === true,
     });
   }
   return items;
@@ -2158,7 +2522,15 @@ function StreamingDot() {
   );
 }
 
-function TurnSnapshotPanel({ snapshot }: { snapshot: TurnSnapshot }) {
+function TurnSnapshotPanel({
+  snapshot,
+  sessionKey,
+  onResumeSafeTools,
+}: {
+  snapshot: TurnSnapshot;
+  sessionKey?: string | null;
+  onResumeSafeTools?: () => void;
+}) {
   const { t } = useTranslation();
   return (
     <section
@@ -2212,6 +2584,32 @@ function TurnSnapshotPanel({ snapshot }: { snapshot: TurnSnapshot }) {
           }
         />
       </dl>
+      <div className="mt-2 grid gap-2 lg:grid-cols-2 xl:grid-cols-4">
+        <WorkbenchPanel
+          title="Task plan"
+          subtitle="Current, completed, and waiting steps"
+        >
+          <TaskPlanPanel items={snapshot.taskPlanItems} />
+        </WorkbenchPanel>
+        <WorkbenchPanel
+          title="Check results"
+          subtitle="Focused check status and latest failure"
+        >
+          <CheckResultsPanel summary={snapshot.checkSummary} />
+        </WorkbenchPanel>
+        <WorkbenchPanel
+          title="Diff preview"
+          subtitle="Edited files, size hints, and file-level impact"
+        >
+          <DiffPreviewPanel preview={snapshot.diffPreview} />
+        </WorkbenchPanel>
+        <WorkbenchPanel
+          title="Turn summary"
+          subtitle="Edits, risks, and next action"
+        >
+          <TurnSummaryPanel summary={snapshot.turnSummary} />
+        </WorkbenchPanel>
+      </div>
       {snapshot.reviewRequiredToolCount > 0 ||
       snapshot.needsInputToolCount > 0 ||
       snapshot.blockedToolCount > 0 ? (
@@ -2228,7 +2626,12 @@ function TurnSnapshotPanel({ snapshot }: { snapshot: TurnSnapshot }) {
         </div>
       ) : null}
       {snapshot.recoveryReviewItems.length > 0 ? (
-        <RecoveryReviewList items={snapshot.recoveryReviewItems} />
+        <RecoveryReviewList
+          items={snapshot.recoveryReviewItems}
+          sessionKey={sessionKey}
+          onResumeSafeTools={onResumeSafeTools}
+          safeResumeCount={snapshot.safeResumeToolCount}
+        />
       ) : null}
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10.5px] text-muted-foreground/70">
         <span
@@ -2321,10 +2724,73 @@ function TurnSnapshotPanel({ snapshot }: { snapshot: TurnSnapshot }) {
   );
 }
 
-function RecoveryReviewList({ items }: { items: RecoveryReviewItem[] }) {
+function RecoveryReviewList({
+  items,
+  sessionKey,
+  onResumeSafeTools,
+  safeResumeCount,
+}: {
+  items: RecoveryReviewItem[];
+  sessionKey?: string | null;
+  onResumeSafeTools?: () => void;
+  safeResumeCount: number;
+}) {
   const { t } = useTranslation();
+  const clientContext = useOptionalClient();
+  const groupedItems = groupRecoveryReviewItems(items);
+  const [submittingId, setSubmittingId] = useState<string | null>(null);
+  const [errorById, setErrorById] = useState<Record<string, string>>({});
+  const [inputById, setInputById] = useState<Record<string, string>>({});
+  const [localStateById, setLocalStateById] = useState<
+    Record<string, RecoveryReviewLocalState>
+  >({});
+
+  const submitAction = async (
+    item: RecoveryReviewItem,
+    action: "confirm_retry" | "provide_input",
+  ) => {
+    if (!clientContext?.token || !item.toolCallId || !sessionKey) return;
+    if (action === "provide_input" && !(inputById[item.toolCallId] || "").trim()) {
+      setErrorById((prev) => ({ ...prev, [item.toolCallId!]: "Input required" }));
+      return;
+    }
+    setSubmittingId(item.toolCallId);
+    setErrorById((prev) => ({ ...prev, [item.toolCallId!]: "" }));
+    try {
+      await applyRecoveryAction(clientContext.token, {
+        sessionKey,
+        toolCallId: item.toolCallId,
+        action,
+        userInput:
+          action === "provide_input" ? inputById[item.toolCallId].trim() : undefined,
+      });
+      setLocalStateById((prev) => ({
+        ...prev,
+        [item.toolCallId!]: {
+          reviewState:
+            action === "confirm_retry" ? "confirmed" : "input_provided",
+          statusLabel:
+            action === "confirm_retry" ? "Retry confirmed" : "Input collected",
+        },
+      }));
+      if (action === "provide_input") {
+        setInputById((prev) => ({
+          ...prev,
+          [item.toolCallId!]: "",
+        }));
+      }
+    } catch {
+      setErrorById((prev) => ({
+        ...prev,
+        [item.toolCallId!]: "Could not apply action",
+      }));
+    } finally {
+      setSubmittingId(null);
+    }
+  };
   return (
     <div
+      id="recovery-review"
       aria-label="Recovery review"
       className="mt-1.5 rounded-md border border-border/40 bg-muted/15"
     >
@@ -2333,35 +2799,217 @@ function RecoveryReviewList({ items }: { items: RecoveryReviewItem[] }) {
           defaultValue: "Recovery review",
         })}
       </div>
-      <div className="divide-y divide-border/30">
-        {items.map((item, index) => (
+      <div className="space-y-2 px-2 py-2">
+        {groupedItems.map(({ group, items: groupItems }) => (
           <div
-            key={`${item.toolCallId || item.name}-${index}`}
-            className="grid gap-1 px-2 py-1.5 sm:grid-cols-[minmax(0,1fr)_auto]"
+            key={group}
+            className="rounded-md border border-border/35 bg-background/35"
           >
-            <div className="min-w-0">
-              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                <span className="truncate font-medium text-muted-foreground">
-                  {item.name}
+            <div className="flex items-center justify-between gap-2 border-b border-border/30 px-2 py-1.5">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <RecoveryReviewBadge group={group} />
+                <span className="text-[11px] font-medium text-muted-foreground/70">
+                  {groupItems.length}
                 </span>
-                <RecoveryReviewBadge group={item.group} />
               </div>
-              {item.reason ? (
-                <div className="mt-0.5 truncate text-[11px] text-muted-foreground/65">
-                  {formatRecoveryToken(item.reason)}
-                </div>
-              ) : null}
+              {group === "safe_resume" && onResumeSafeTools && safeResumeCount > 0 ? (
+                <button
+                  type="button"
+                  onClick={onResumeSafeTools}
+                  className="inline-flex items-center rounded border border-emerald-500/25 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/15 dark:text-emerald-300"
+                >
+                  Resume safe tools
+                </button>
+              ) : (
+                <span className="text-[10px] font-medium text-muted-foreground/55">
+                  {groupActionHint(group)}
+                </span>
+              )}
             </div>
-            {item.recoveryAction ? (
-              <div className="self-center text-[11px] font-medium text-muted-foreground/70">
-                {formatRecoveryToken(item.recoveryAction)}
-              </div>
-            ) : null}
+            <div className="divide-y divide-border/25">
+              {groupItems.map((item, index) => (
+                <RecoveryReviewRow
+                  key={`${item.toolCallId || item.name}-${index}`}
+                  item={item}
+                  sessionKey={sessionKey}
+                  token={clientContext?.token}
+                  inputValue={item.toolCallId ? (inputById[item.toolCallId] ?? "") : ""}
+                  error={item.toolCallId ? errorById[item.toolCallId] : undefined}
+                  isSubmitting={submittingId === item.toolCallId}
+                  localState={item.toolCallId ? localStateById[item.toolCallId] : undefined}
+                  onInputChange={(value) => {
+                    if (!item.toolCallId) return;
+                    setInputById((prev) => ({
+                      ...prev,
+                      [item.toolCallId!]: value,
+                    }));
+                  }}
+                  onSubmitAction={submitAction}
+                />
+              ))}
+            </div>
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function RecoveryReviewRow({
+  item,
+  sessionKey,
+  token,
+  inputValue,
+  error,
+  isSubmitting,
+  localState,
+  onInputChange,
+  onSubmitAction,
+}: {
+  item: RecoveryReviewItem;
+  sessionKey?: string | null;
+  token?: string;
+  inputValue: string;
+  error?: string;
+  isSubmitting: boolean;
+  localState?: RecoveryReviewLocalState;
+  onInputChange: (value: string) => void;
+  onSubmitAction: (
+    item: RecoveryReviewItem,
+    action: "confirm_retry" | "provide_input",
+  ) => Promise<void>;
+}) {
+  const effectiveState = localState?.reviewState || item.reviewState || "pending";
+  const statusLabel =
+    localState?.statusLabel ||
+    item.statusLabel ||
+    item.actionLabel ||
+    (item.recoveryAction ? formatRecoveryToken(item.recoveryAction) : "");
+  const showConfirmButton =
+    item.group === "review_required"
+    && item.toolCallId
+    && !["confirmed", "input_provided"].includes(effectiveState);
+  const showInputForm =
+    item.group === "needs_input"
+    && item.toolCallId
+    && effectiveState !== "input_provided";
+
+  return (
+    <div className="grid gap-2 px-2 py-1.5 sm:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="truncate font-medium text-muted-foreground">
+            {item.name}
+          </span>
+          {item.reviewKind ? (
+            <span className="rounded-full border border-border/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/70">
+              {formatRecoveryToken(item.reviewKind)}
+            </span>
+          ) : null}
+          {item.scope ? (
+            <span className="rounded-full border border-border/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/60">
+              {item.scope}
+            </span>
+          ) : null}
+          {statusLabel ? (
+            <span className="rounded-full border border-border/40 bg-background/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/70">
+              {statusLabel}
+            </span>
+          ) : null}
+        </div>
+        {item.summary ? (
+          <div className="mt-0.5 truncate text-[11px] text-muted-foreground/75">
+            {item.summary}
+          </div>
+        ) : null}
+        {item.reason ? (
+          <div className="mt-0.5 truncate text-[11px] text-muted-foreground/65">
+            {formatRecoveryToken(item.reason)}
+          </div>
+        ) : null}
+        {showInputForm ? (
+          <div className="mt-2 flex flex-col gap-1.5">
+            <input
+              value={inputValue}
+              onChange={(event) => onInputChange(event.target.value)}
+              placeholder={item.inputPlaceholder || "Provide missing input"}
+              className="h-8 rounded border border-border/50 bg-background px-2 text-[11px]"
+            />
+            {error ? (
+              <span className="text-[10px] text-destructive">{error}</span>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <div className="flex items-center justify-end gap-2 self-center">
+        {showConfirmButton ? (
+          <button
+            type="button"
+            disabled={isSubmitting || !token || !sessionKey}
+            onClick={() => void onSubmitAction(item, "confirm_retry")}
+            className="inline-flex items-center rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-700 disabled:opacity-60 dark:text-amber-300"
+          >
+            Confirm retry
+          </button>
+        ) : null}
+        {showInputForm ? (
+          <button
+            type="button"
+            disabled={isSubmitting || !token || !sessionKey}
+            onClick={() => void onSubmitAction(item, "provide_input")}
+            className="inline-flex items-center rounded border border-sky-500/25 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-700 disabled:opacity-60 dark:text-sky-300"
+          >
+            Submit input
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function groupRecoveryReviewItems(items: RecoveryReviewItem[]): Array<{
+  group: RecoveryReviewGroup;
+  items: RecoveryReviewItem[];
+}> {
+  const priority: RecoveryReviewGroup[] = [
+    "safe_resume",
+    "review_required",
+    "needs_input",
+    "blocked",
+  ];
+  const grouped = new Map<RecoveryReviewGroup, RecoveryReviewItem[]>();
+  for (const item of items) {
+    const current = grouped.get(item.group) ?? [];
+    current.push(item);
+    grouped.set(item.group, current);
+  }
+  const ordered: Array<{ group: RecoveryReviewGroup; items: RecoveryReviewItem[] }> = [];
+  for (const group of priority) {
+    const groupItems = grouped.get(group);
+    if (groupItems?.length) {
+      ordered.push({ group, items: groupItems });
+      grouped.delete(group);
+    }
+  }
+  for (const [group, groupItems] of grouped.entries()) {
+    ordered.push({ group, items: groupItems });
+  }
+  return ordered;
+}
+
+function groupActionHint(group: RecoveryReviewGroup): string {
+  if (group === "review_required") return "Review details before retry";
+  if (group === "needs_input") return "Collect missing input";
+  if (group === "blocked") return "Revise the request first";
+  return "Pending action";
+}
+
+function jumpToWorkbenchAnchor(anchorId: string) {
+  if (typeof document === "undefined") return;
+  document.getElementById(anchorId)?.scrollIntoView({
+    block: "nearest",
+    behavior: "smooth",
+  });
 }
 
 function RecoveryReviewBadge({ group }: { group: RecoveryReviewGroup }) {
@@ -2417,6 +3065,272 @@ function recoveryReviewSummary(snapshot: TurnSnapshot): string {
     parts.push(`${snapshot.blockedToolCount} blocked`);
   }
   return `Review before retry: ${parts.join(", ")}.`;
+}
+
+function WorkbenchPanel({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded border border-border/35 bg-muted/15 px-2 py-2">
+      <div className="mb-1.5">
+        <div className="font-medium text-muted-foreground">{title}</div>
+        <div className="text-[10.5px] text-muted-foreground/65">{subtitle}</div>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function TaskPlanPanel({ items }: { items: TaskPlanItem[] }) {
+  return (
+    <ol className="space-y-1.5" aria-label="Task plan">
+      {items.map((item) => (
+        <li
+          key={item.key}
+          className="flex items-start gap-2 rounded border border-border/25 bg-background/35 px-2 py-1.5"
+        >
+          <SnapshotStateBadge status={item.status} />
+          <div className="min-w-0">
+            <div className="font-medium text-muted-foreground">{item.label}</div>
+            <div className="text-[10.5px] text-muted-foreground/70">
+              {item.detail || "No detail provided."}
+            </div>
+            {item.anchorId && item.actionLabel ? (
+              <button
+                type="button"
+                onClick={() => jumpToWorkbenchAnchor(item.anchorId!)}
+                className="mt-1 inline-flex items-center rounded border border-border/40 bg-background/50 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/75 hover:bg-background"
+              >
+                {item.actionLabel}
+              </button>
+            ) : null}
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function CheckResultsPanel({ summary }: { summary: WorkbenchCheckSummary }) {
+  const stateLabel =
+    summary.failed > 0
+      ? `${summary.failed} failed`
+      : summary.running > 0
+        ? `${summary.running} running`
+        : summary.passed > 0
+          ? `${summary.passed} passed`
+          : "Not run";
+  return (
+    <div id="check-results" className="space-y-1.5" aria-label="Check results">
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        <SnapshotMetric label="Status" value={stateLabel} tone={summary.failed > 0 ? "danger" : summary.passed > 0 ? "success" : undefined} />
+        <SnapshotMetric
+          label="Command"
+          value={summary.primaryCommand || "No check command"}
+        />
+      </div>
+      {summary.failureCategory || summary.relatedTarget ? (
+        <div className="grid gap-1.5 sm:grid-cols-2">
+          {summary.failureCategory ? (
+            <SnapshotMetric
+              label="Failure kind"
+              value={formatRecoveryToken(summary.failureCategory)}
+              tone={summary.failed > 0 ? "danger" : undefined}
+            />
+          ) : null}
+          {summary.relatedTarget ? (
+            <SnapshotMetric
+              label="Related target"
+              value={summary.relatedTarget}
+            />
+          ) : null}
+        </div>
+      ) : null}
+      {summary.failureSummary ? (
+        <div className="rounded border border-destructive/20 bg-destructive/5 px-2 py-1.5 text-[10.5px] text-destructive">
+          {summary.failureSummary}
+        </div>
+      ) : (
+        <div className="rounded border border-border/25 bg-background/35 px-2 py-1.5 text-[10.5px] text-muted-foreground/70">
+          No failure summary available.
+        </div>
+      )}
+      {summary.diagnosticLabel || summary.diagnosticHint || summary.recommendedAction ? (
+        <div className="space-y-1 rounded border border-amber-500/20 bg-amber-500/5 px-2 py-1.5">
+          {summary.diagnosticLabel ? (
+            <div className="font-medium text-amber-800 dark:text-amber-200">
+              {summary.diagnosticLabel}
+            </div>
+          ) : null}
+          {summary.diagnosticHint ? (
+            <div className="text-[10.5px] text-amber-900/80 dark:text-amber-100/85">
+              {summary.diagnosticHint}
+            </div>
+          ) : null}
+          {summary.recommendedAction ? (
+            <div className="text-[10.5px] text-amber-900/80 dark:text-amber-100/85">
+              Next: {summary.recommendedAction}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DiffPreviewPanel({ preview }: { preview: WorkbenchDiffPreview }) {
+  if (preview.total === 0) {
+    return (
+      <div
+        id="diff-preview"
+        aria-label="Diff preview"
+        className="rounded border border-border/25 bg-background/35 px-2 py-1.5 text-[10.5px] text-muted-foreground/70"
+      >
+        No file edits captured in this turn.
+      </div>
+    );
+  }
+  return (
+    <div id="diff-preview" className="space-y-1.5" aria-label="Diff preview">
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        <SnapshotMetric label="Files" value={`${preview.total} changed`} />
+        <SnapshotMetric label="Flags" value={diffPreviewFlagsLabel(preview)} />
+      </div>
+      <ul className="space-y-1">
+        {preview.items.map((edit) => (
+          <li
+            key={edit.key}
+            className="rounded border border-border/25 bg-background/35 px-2 py-1.5"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <FileChangeBadge kind={edit.changeKind} />
+                  <span className="truncate font-medium text-muted-foreground">
+                    {edit.path || "Pending file edit"}
+                  </span>
+                  <span className="rounded-full border border-border/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/70">
+                    {fileAreaLabel(edit.area)}
+                  </span>
+                  {edit.binary ? (
+                    <DiffPreviewFlag label="Binary" tone="neutral" />
+                  ) : null}
+                  {edit.approximate ? (
+                    <DiffPreviewFlag label="Estimated" tone="neutral" />
+                  ) : null}
+                  {edit.status === "error" ? (
+                    <DiffPreviewFlag label="Failed" tone="danger" />
+                  ) : null}
+                  {edit.added + edit.deleted >= LARGE_DIFF_LINE_THRESHOLD ? (
+                    <DiffPreviewFlag label="Large change" tone="warning" />
+                  ) : null}
+                </div>
+              </div>
+              {!edit.binary && edit.status !== "error" ? (
+                <DiffPair added={edit.added} deleted={edit.deleted} />
+              ) : null}
+            </div>
+          </li>
+        ))}
+      </ul>
+      {preview.total > preview.items.length ? (
+        <div className="text-[10.5px] text-muted-foreground/65">
+          Showing {preview.items.length} of {preview.total} changed files.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function TurnSummaryPanel({ summary }: { summary: WorkbenchTurnSummary }) {
+  return (
+    <dl className="space-y-1.5" aria-label="Turn summary">
+      <SummaryRow label="Changed">{summary.modifiedSummary}</SummaryRow>
+      <SummaryRow label="Checks">{summary.checksSummary}</SummaryRow>
+      <SummaryRow label="Risk">{summary.riskSummary}</SummaryRow>
+      <SummaryRow
+        label="Next step"
+        action={
+          summary.nextStepAnchorId && summary.nextStepActionLabel ? (
+            <button
+              type="button"
+              onClick={() => jumpToWorkbenchAnchor(summary.nextStepAnchorId!)}
+              className="inline-flex items-center rounded border border-border/40 bg-background/50 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/75 hover:bg-background"
+            >
+              {summary.nextStepActionLabel}
+            </button>
+          ) : undefined
+        }
+      >
+        {summary.nextStep}
+      </SummaryRow>
+    </dl>
+  );
+}
+
+function SummaryRow({
+  label,
+  action,
+  children,
+}: {
+  label: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="rounded border border-border/25 bg-background/35 px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <dt className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground/55">
+          {label}
+        </dt>
+        {action}
+      </div>
+      <dd className="mt-0.5 text-[10.5px] text-muted-foreground">{children}</dd>
+    </div>
+  );
+}
+
+function DiffPreviewFlag({
+  label,
+  tone,
+}: {
+  label: string;
+  tone: "neutral" | "warning" | "danger";
+}) {
+  return (
+    <span
+      className={cn(
+        "rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+        tone === "neutral" &&
+          "border-border/40 bg-background/40 text-muted-foreground/70",
+        tone === "warning" &&
+          "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        tone === "danger" &&
+          "border-destructive/20 bg-destructive/10 text-destructive",
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+function diffPreviewFlagsLabel(preview: WorkbenchDiffPreview): string {
+  const parts: string[] = [];
+  if (preview.binaryCount > 0) parts.push(`${preview.binaryCount} binary`);
+  if (preview.largeChangeCount > 0) {
+    parts.push(`${preview.largeChangeCount} large`);
+  }
+  if (preview.approximateCount > 0) {
+    parts.push(`${preview.approximateCount} estimated`);
+  }
+  if (preview.failedCount > 0) parts.push(`${preview.failedCount} failed`);
+  return parts.length > 0 ? parts.join(" · ") : "No special flags";
 }
 
 function SnapshotMetric({
@@ -2678,6 +3592,13 @@ function TraceRow({
             {trace.summary}
           </div>
         ) : null}
+        {trace.diagnosticHint || trace.recommendedAction ? (
+          <div className="mt-0.5 truncate text-[10.5px] text-amber-700/90 dark:text-amber-200/85">
+            {trace.diagnosticHint}
+            {trace.diagnosticHint && trace.recommendedAction ? " " : ""}
+            {trace.recommendedAction}
+          </div>
+        ) : null}
         {trace.elapsedMs !== undefined || trace.durationMs !== undefined ? (
           <div className="mt-0.5 truncate text-[10.5px] text-muted-foreground/60">
             {traceTimingLabel(trace)}
@@ -2802,6 +3723,7 @@ function RecoveryBadge({ trace }: { trace: ParsedToolTrace }) {
 }
 
 function recoveryLabel(trace: ParsedToolTrace): string | null {
+  if (trace.diagnosticLabel) return trace.diagnosticLabel;
   if (trace.needsUserInput) return "Needs input";
   if (trace.blocked) return "Blocked";
   if (trace.retryable) return "Retryable";

@@ -74,3 +74,27 @@ def test_loader_skips_abstract_entry_point_tools():
         discovered = loader._discover_plugins()
 
     assert "abstract_plugin" not in discovered
+
+
+def test_loader_records_plugin_load_diagnostics() -> None:
+    mock_ep = MagicMock()
+    mock_ep.name = "broken_plugin"
+    mock_ep.value = "pkg:BrokenTool"
+    mock_ep.load.side_effect = RuntimeError("boom")
+
+    with patch("nanobot.agent.tools.loader.entry_points", return_value=[mock_ep]):
+        loader = ToolLoader()
+        discovered = loader._discover_plugins()
+
+    assert discovered == {}
+    assert loader.plugin_diagnostics == [
+        {
+            "source": "broken_plugin",
+            "plugin_name": "broken_plugin",
+            "tool_class": "pkg:BrokenTool",
+            "stage": "load",
+            "code": "load_error",
+            "message": "RuntimeError: boom",
+            "config_key": "",
+        }
+    ]

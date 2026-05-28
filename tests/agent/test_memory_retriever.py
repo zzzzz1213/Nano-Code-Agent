@@ -96,3 +96,73 @@ def test_retriever_preserves_path_tokens_and_decision_priority():
     assert result["id"] == "path-decision"
     assert result["category"] == "decision"
     assert result["match_reason"] == "path:nanobot/api/server.py"
+
+
+def test_retriever_prioritizes_exact_path_matches_over_generic_keyword_hits():
+    retr = MemoryRetriever()
+    retr.index_compactions([
+        {
+            "id": "generic-timeout",
+            "summary_full": "Failure: gateway timeout while syncing metadata.",
+            "updated_at": 50,
+        },
+        {
+            "id": "path-timeout",
+            "summary_sections": {
+                "failures": ["Timeout in nanobot/channels/websocket.py while handling reconnects."],
+                "files_touched": ["nanobot/channels/websocket.py"],
+            },
+            "updated_at": 60,
+        },
+    ])
+
+    results = retr.query("nanobot/channels/websocket.py timeout", top_k=2)
+
+    assert [item["id"] for item in results[:2]] == ["path-timeout", "generic-timeout"]
+    assert results[0]["match_reason"] == "path:nanobot/channels/websocket.py"
+
+
+def test_retriever_prioritizes_failure_section_when_query_has_failure_signals():
+    retr = MemoryRetriever()
+    retr.index_compactions([
+        {
+            "id": "decision-doc",
+            "summary_sections": {
+                "decisions": ["Decision: keep retry handling in agent runner."],
+            },
+            "updated_at": 20,
+        },
+        {
+            "id": "failure-doc",
+            "summary_sections": {
+                "failures": ["pytest failed with timeout in tests/agent/test_runner.py"],
+                "commands_run": ["pytest tests/agent/test_runner.py -q"],
+            },
+            "updated_at": 10,
+        },
+    ])
+
+    result = retr.query("pytest timeout failed", top_k=1)[0]
+
+    assert result["id"] == "failure-doc"
+    assert result["match_reason"] == "section:failures"
+
+
+def test_retriever_prefers_more_recent_doc_when_relevance_is_tied():
+    retr = MemoryRetriever()
+    retr.index_compactions([
+        {
+            "id": "older",
+            "summary_full": "Decision: refactor websocket checkpoint recovery.",
+            "updated_at": 100,
+        },
+        {
+            "id": "newer",
+            "summary_full": "Decision: refactor websocket checkpoint recovery.",
+            "updated_at": 200,
+        },
+    ])
+
+    results = retr.query("refactor websocket checkpoint recovery", top_k=2)
+
+    assert [item["id"] for item in results[:2]] == ["newer", "older"]

@@ -6,7 +6,7 @@ import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
-from typing import Any, TypedDict, TypeVar
+from typing import Any, NotRequired, TypedDict, TypeVar
 
 if typing.TYPE_CHECKING:
     from pydantic import BaseModel
@@ -40,6 +40,28 @@ class ToolRegistrationMetadata(TypedDict):
     read_only: bool
     concurrency_safe: bool
     exclusive: bool
+    mcp_server: NotRequired[str]
+    mcp_transport: NotRequired[str]
+    mcp_origin: NotRequired[str]
+    mcp_capability_source: NotRequired[str]
+
+
+class ToolRegistrationIssue(TypedDict):
+    """Structured validation issue for tool registration."""
+
+    code: str
+    message: str
+    field: NotRequired[str]
+
+
+class ToolRegistrationError(ValueError):
+    """Registration failed because a tool violated the static metadata contract."""
+
+    def __init__(self, tool_label: str, issues: list[ToolRegistrationIssue]) -> None:
+        self.tool_label = tool_label
+        self.issues = list(issues)
+        detail = "; ".join(issue["message"] for issue in issues) or "unknown registration error"
+        super().__init__(f"Invalid tool registration for {tool_label!r}: {detail}")
 
 
 class Schema(ABC):
@@ -284,36 +306,79 @@ class Tool(ABC):
         the contract nanobot needs for provider schema generation, scheduling, and
         plugin discovery without attempting to validate every JSON Schema keyword.
         """
-        errors: list[str] = []
+        return [issue["message"] for issue in self.registration_issues()]
+
+    def registration_issues(self) -> list[ToolRegistrationIssue]:
+        """Return structured validation issues for registration failures."""
+        issues: list[ToolRegistrationIssue] = []
 
         name = self.name
         if not isinstance(name, str) or not name.strip():
-            errors.append("name must be a non-empty string")
+            issues.append({
+                "code": "invalid_name",
+                "field": "name",
+                "message": "name must be a non-empty string",
+            })
         elif not _TOOL_NAME_RE.fullmatch(name):
-            errors.append("name may only contain letters, numbers, underscores, and hyphens")
+            issues.append({
+                "code": "invalid_name",
+                "field": "name",
+                "message": "name may only contain letters, numbers, underscores, and hyphens",
+            })
 
         description = self.description
         if not isinstance(description, str) or not description.strip():
-            errors.append("description must be a non-empty string")
+            issues.append({
+                "code": "missing_description",
+                "field": "description",
+                "message": "description must be a non-empty string",
+            })
 
         schema = self.parameters
         if not isinstance(schema, dict):
-            errors.append(f"parameters must be a JSON object schema, got {type(schema).__name__}")
+            issues.append({
+                "code": "invalid_schema",
+                "field": "parameters",
+                "message": f"parameters must be a JSON object schema, got {type(schema).__name__}",
+            })
         else:
             if schema.get("type", "object") != "object":
-                errors.append(f"parameters schema must be object type, got {schema.get('type')!r}")
+                issues.append({
+                    "code": "invalid_schema",
+                    "field": "parameters.type",
+                    "message": f"parameters schema must be object type, got {schema.get('type')!r}",
+                })
             properties = schema.get("properties", {})
             if properties is not None and not isinstance(properties, dict):
-                errors.append("parameters.properties must be an object when provided")
+                issues.append({
+                    "code": "invalid_schema",
+                    "field": "parameters.properties",
+                    "message": "parameters.properties must be an object when provided",
+                })
             required = schema.get("required", [])
             if required is not None and not isinstance(required, list):
-                errors.append("parameters.required must be a list when provided")
+                issues.append({
+                    "code": "invalid_schema",
+                    "field": "parameters.required",
+                    "message": "parameters.required must be a list when provided",
+                })
 
         scopes = getattr(self, "_scopes", {"core"})
         if not isinstance(scopes, set) or not all(isinstance(scope, str) for scope in scopes):
-            errors.append("_scopes must be a set of strings")
+            issues.append({
+                "code": "invalid_scope",
+                "field": "_scopes",
+                "message": "_scopes must be a set of strings",
+            })
 
-        return errors
+        if self.read_only and self.exclusive:
+            issues.append({
+                "code": "capability_conflict",
+                "field": "capabilities",
+                "message": "read_only and exclusive cannot both be true",
+            })
+
+        return issues
 
     def registration_metadata(self) -> ToolRegistrationMetadata:
         """Return standardized metadata for registry/UI/scheduler consumers."""

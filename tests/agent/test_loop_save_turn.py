@@ -577,6 +577,18 @@ def test_restore_runtime_checkpoint_marks_safe_read_only_tools_resumable() -> No
             "group": "safe_resume",
             "reason": "read_only_safe_candidate",
             "recovery_action": "resume_safe",
+            "action_label": "Resume safe tools",
+            "review_kind": "read_only",
+            "summary": "path: README.md",
+            "config_key": "",
+            "scope": "",
+            "can_resume_now": True,
+            "can_retry_now": True,
+            "review_state": "ready_to_resume",
+            "status_label": "Ready to resume",
+            "input_required": False,
+            "input_placeholder": None,
+            "review_confirmed": False,
         },
         {
             "tool_call_id": "call_shell",
@@ -584,6 +596,18 @@ def test_restore_runtime_checkpoint_marks_safe_read_only_tools_resumable() -> No
             "group": "review_required",
             "reason": "shell_command_requires_review",
             "recovery_action": "review_before_retry",
+            "action_label": "Review before retry",
+            "review_kind": "shell",
+            "summary": "command available during review",
+            "config_key": "exec",
+            "scope": "exec",
+            "can_resume_now": False,
+            "can_retry_now": False,
+            "review_state": "awaiting_review",
+            "status_label": "Waiting for confirmation",
+            "input_required": False,
+            "input_placeholder": None,
+            "review_confirmed": False,
         },
     ]
     assert recovered["retryable_tool_call_ids"] == []
@@ -600,6 +624,26 @@ def test_restore_runtime_checkpoint_groups_review_only_tools() -> None:
             "exclusive": False,
             "config_key": "mcp",
             "scopes": ("mcp",),
+        },
+        "mcp_local_read_issue": {
+            "read_only": True,
+            "concurrency_safe": True,
+            "exclusive": False,
+            "config_key": "mcp",
+            "scopes": ("mcp",),
+            "mcp_origin": "local",
+            "mcp_transport": "stdio",
+            "mcp_capability_source": "heuristic_read",
+        },
+        "mcp_local_annotated_read": {
+            "read_only": True,
+            "concurrency_safe": True,
+            "exclusive": False,
+            "config_key": "mcp",
+            "scopes": ("mcp",),
+            "mcp_origin": "local",
+            "mcp_transport": "stdio",
+            "mcp_capability_source": "annotation",
         },
         "mcp_write_issue": {
             "read_only": False,
@@ -624,6 +668,16 @@ def test_restore_runtime_checkpoint_groups_review_only_tools() -> None:
             "id": "call_mcp_read",
             "type": "function",
             "function": {"name": "mcp_read_issue", "arguments": "{}"},
+        },
+        {
+            "id": "call_mcp_local_read",
+            "type": "function",
+            "function": {"name": "mcp_local_read_issue", "arguments": "{}"},
+        },
+        {
+            "id": "call_mcp_local_annotated",
+            "type": "function",
+            "function": {"name": "mcp_local_annotated_read", "arguments": "{}"},
         },
         {
             "id": "call_needs_input",
@@ -659,18 +713,25 @@ def test_restore_runtime_checkpoint_groups_review_only_tools() -> None:
     assert restored is True
     recovered = loop._consume_restored_runtime_checkpoint(session)
     assert recovered is not None
-    assert recovered["safe_resume_tool_call_ids"] == ["call_mcp_read"]
-    assert recovered["review_required_tool_call_ids"] == ["call_write", "call_mcp_write"]
+    assert recovered["safe_resume_tool_call_ids"] == ["call_mcp_read", "call_mcp_local_annotated"]
+    assert recovered["review_required_tool_call_ids"] == [
+        "call_write",
+        "call_mcp_write",
+        "call_mcp_local_read",
+    ]
     assert recovered["needs_input_tool_call_ids"] == ["call_needs_input"]
     assert recovered["blocked_tool_call_ids"] == ["call_blocked"]
-    reasons = {
-        item["tool_call_id"]: item["reason"]
+    reasons = {item["tool_call_id"]: item["reason"] for item in recovered["recovery_review_items"]}
+    review_kinds = {
+        item["tool_call_id"]: item["review_kind"]
         for item in recovered["recovery_review_items"]
     }
     assert reasons["call_write"] == "write_tool_requires_review"
     assert reasons["call_mcp_write"] == "mcp_mutating_tool_requires_review"
+    assert reasons["call_mcp_local_read"] == "mcp_local_tool_requires_review"
     assert reasons["call_needs_input"] == "requires_user_input"
     assert reasons["call_blocked"] == "safety_block"
+    assert review_kinds["call_mcp_local_read"] == "mcp_local"
 
 
 @pytest.mark.asyncio
@@ -751,6 +812,150 @@ async def test_resume_safe_runtime_checkpoint_executes_read_only_candidates(tmp_
     assert AgentLoop._RUNTIME_CHECKPOINT_KEY not in session.metadata
 
 
+@pytest.mark.asyncio
+async def test_apply_recovery_review_action_confirms_review_required_tool(tmp_path: Path) -> None:
+    loop = _mk_loop()
+    loop.tools = MagicMock()
+    loop.tools.get_metadata.side_effect = lambda name: {
+        "exec": {
+            "read_only": False,
+            "concurrency_safe": False,
+            "exclusive": True,
+            "config_key": "exec",
+            "scopes": ("exec",),
+        },
+    }.get(name)
+    loop.sessions = SessionManager(tmp_path)
+    session = Session(
+        key="test:checkpoint-confirm-retry",
+        metadata={
+            AgentLoop._RUNTIME_CHECKPOINT_KEY: {
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": "working",
+                    "tool_calls": [
+                        {
+                            "id": "call_shell",
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": "{\"command\":\"pytest -q\"}",
+                            },
+                        }
+                    ],
+                },
+                "completed_tool_results": [],
+                "pending_tool_calls": [
+                    {
+                        "id": "call_shell",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"command\":\"pytest -q\"}",
+                        },
+                        "recovery_action": "review_before_retry",
+                    }
+                ],
+            }
+        },
+    )
+
+    checkpoint = await loop._apply_recovery_review_action(
+        session,
+        tool_call_id="call_shell",
+        action="confirm_retry",
+    )
+
+    assert checkpoint is not None
+    assert checkpoint["review_required_tool_count"] == 1
+    pending = checkpoint["pending_tool_calls"][0]
+    assert pending["review_state"] == "confirmed"
+    assert pending["review_confirmed"] is True
+    assert pending["retryable"] is True
+    assert pending["recovery_action"] == "retry"
+    assert pending["needs_user_input"] is False
+    review_item = checkpoint["recovery_review_items"][0]
+    assert review_item["review_state"] == "confirmed"
+    assert review_item["status_label"] == "Retry confirmed"
+    assert review_item["can_retry_now"] is True
+    assert review_item["review_confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_recovery_review_action_records_user_input_for_needs_input_tool(
+    tmp_path: Path,
+) -> None:
+    loop = _mk_loop()
+    loop.tools = MagicMock()
+    loop.tools.get_metadata.side_effect = lambda name: {
+        "mcp_fetch_context": {
+            "read_only": True,
+            "concurrency_safe": False,
+            "exclusive": False,
+            "config_key": "mcp",
+            "scopes": ("mcp",),
+        },
+    }.get(name)
+    loop.sessions = SessionManager(tmp_path)
+    session = Session(
+        key="test:checkpoint-provide-input",
+        metadata={
+            AgentLoop._RUNTIME_CHECKPOINT_KEY: {
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": "working",
+                    "tool_calls": [
+                        {
+                            "id": "call_input",
+                            "type": "function",
+                            "function": {
+                                "name": "mcp_fetch_context",
+                                "arguments": "{\"query\":\"build error\"}",
+                            },
+                        }
+                    ],
+                },
+                "completed_tool_results": [],
+                "pending_tool_calls": [
+                    {
+                        "id": "call_input",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_fetch_context",
+                            "arguments": "{\"query\":\"build error\"}",
+                        },
+                        "recovery_action": "ask_user",
+                        "needs_user_input": True,
+                    }
+                ],
+            }
+        },
+    )
+
+    checkpoint = await loop._apply_recovery_review_action(
+        session,
+        tool_call_id="call_input",
+        action="provide_input",
+        user_input="use the latest failing stack trace",
+    )
+
+    assert checkpoint is not None
+    assert checkpoint["needs_input_tool_count"] == 0
+    assert checkpoint["review_required_tool_count"] == 1
+    pending = checkpoint["pending_tool_calls"][0]
+    assert pending["review_state"] == "input_provided"
+    assert pending["review_confirmed"] is True
+    assert pending["provided_user_input"] == "use the latest failing stack trace"
+    assert pending["retryable"] is True
+    assert pending["recovery_action"] == "retry"
+    assert pending["needs_user_input"] is False
+    review_item = checkpoint["recovery_review_items"][0]
+    assert review_item["review_state"] == "input_provided"
+    assert review_item["status_label"] == "Input collected"
+    assert review_item["can_retry_now"] is True
+    assert review_item["input_required"] is False
+
+
 def test_build_turn_checkpoint_exposes_recovery_tool_ids() -> None:
     checkpoint = build_turn_checkpoint(
         {
@@ -807,6 +1012,8 @@ def test_build_turn_checkpoint_exposes_recovery_tool_ids() -> None:
                     "group": "review_required",
                     "reason": "shell_command_requires_review",
                     "recovery_action": "review_before_retry",
+                    "review_state": "awaiting_review",
+                    "status_label": "Waiting for confirmation",
                 }
             ],
             "recovery_review_count": 1,
@@ -853,6 +1060,8 @@ def test_build_turn_checkpoint_exposes_recovery_tool_ids() -> None:
             "group": "review_required",
             "reason": "shell_command_requires_review",
             "recovery_action": "review_before_retry",
+            "review_state": "awaiting_review",
+            "status_label": "Waiting for confirmation",
         }
     ]
     assert checkpoint["recovery_review_count"] == 1

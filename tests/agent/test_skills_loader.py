@@ -449,6 +449,61 @@ def test_select_task_skills_uses_priority_then_score(tmp_path: Path) -> None:
     assert loader.select_task_skills("pytest failed") == ["high", "low"]
 
 
+def test_select_task_skills_filters_conflicting_lower_priority_match(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    skills_root.mkdir(parents=True)
+    builtin = tmp_path / "builtin"
+    _write_skill(
+        builtin,
+        "planner",
+        metadata_json={
+            "task_keywords": ["migration", "rollout"],
+            "priority": 6,
+            "conflicts_with": ["upgrader"],
+        },
+        body="# Planner",
+    )
+    _write_skill(
+        builtin,
+        "upgrader",
+        metadata_json={
+            "task_keywords": ["migration", "upgrade"],
+            "priority": 9,
+            "conflicts_with": ["planner"],
+        },
+        body="# Upgrader",
+    )
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    assert loader.select_task_skills("Plan a migration and upgrade rollout") == ["upgrader"]
+
+
+def test_select_task_skill_matches_prefers_more_specific_keyword_when_priority_ties(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    skills_root = workspace / "skills"
+    skills_root.mkdir(parents=True)
+    builtin = tmp_path / "builtin"
+    _write_skill(
+        builtin,
+        "generic",
+        metadata_json={"task_keywords": ["upgrade"], "priority": 5},
+        body="# Generic",
+    )
+    _write_skill(
+        builtin,
+        "specific",
+        metadata_json={"task_keywords": ["dependency upgrade"], "priority": 5},
+        body="# Specific",
+    )
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    matches = loader.select_task_skill_matches("Please do a dependency upgrade", limit=2)
+
+    assert [match["name"] for match in matches] == ["specific", "generic"]
+
+
 def test_select_task_skill_matches_returns_safe_reason_metadata(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -466,3 +521,84 @@ def test_select_task_skill_matches_returns_safe_reason_metadata(tmp_path: Path) 
     assert "review" in review["matched_keywords"]
     assert str(review["reason"]).startswith("matched:")
     assert "content" not in review
+
+
+def test_select_task_skill_matches_builtin_conflict_keeps_dependency_upgrade_over_migration(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    matches = loader.select_task_skill_matches(
+        "Plan the migration rollout and upgrade dependency versions safely.",
+        exclude=set(loader.get_always_skills()),
+        limit=3,
+    )
+
+    names = [match["name"] for match in matches]
+    assert "dependency-upgrade" in names
+    assert "migration-planning" not in names
+
+
+def test_builtin_engineering_skills_are_discoverable(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    names = {entry["name"] for entry in loader.list_skills(filter_unavailable=False)}
+
+    assert "frontend-implementation" in names
+    assert "migration-planning" in names
+    assert "dependency-upgrade" in names
+    assert "docs-sync" in names
+
+
+def test_select_task_skills_matches_frontend_implementation(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    selected = loader.select_task_skills(
+        "Implement a responsive React component and refine the page layout CSS.",
+        exclude=set(loader.get_always_skills()),
+    )
+
+    assert "frontend-implementation" in selected
+
+
+def test_select_task_skills_matches_migration_planning(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    selected = loader.select_task_skills(
+        "Plan a schema migration with compatibility and phased rollout steps.",
+        exclude=set(loader.get_always_skills()),
+    )
+
+    assert "migration-planning" in selected
+
+
+def test_select_task_skills_matches_dependency_upgrade(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    selected = loader.select_task_skills(
+        "Upgrade dependency versions and bump the package upgrade safely.",
+        exclude=set(loader.get_always_skills()),
+    )
+
+    assert "dependency-upgrade" in selected
+
+
+def test_select_task_skills_matches_docs_sync(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    loader = SkillsLoader(workspace)
+    selected = loader.select_task_skills(
+        "Update docs, README, and CHANGELOG so the documentation matches the new flow.",
+        exclude=set(loader.get_always_skills()),
+    )
+
+    assert "docs-sync" in selected

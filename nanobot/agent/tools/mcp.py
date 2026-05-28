@@ -38,6 +38,10 @@ _READ_ONLY_NAME_RE = re.compile(
     r"view|show|stat|status|info|metadata|schema|catalog|resolve)($|[_-])",
     re.IGNORECASE,
 )
+_READ_ONLY_SERVER_RE = re.compile(
+    r"(^|[_-])(docs?|catalog|schema|reference|search|knowledge|context|read|viewer?)($|[_-])",
+    re.IGNORECASE,
+)
 _MUTATING_NAME_RE = re.compile(
     r"(^|[_-])(create|update|delete|remove|write|edit|patch|apply|run|execute|exec|"
     r"shell|command|upload|install|start|stop|restart|send|post|put|publish|commit|"
@@ -57,6 +61,7 @@ _MUTATING_SCHEMA_KEYS: frozenset[str] = frozenset((
     "text",
     "value",
 ))
+_REMOTE_MCP_TRANSPORTS: frozenset[str] = frozenset(("sse", "streamableHttp"))
 
 
 def _sanitize_name(name: str) -> str:
@@ -88,31 +93,10 @@ def _schema_property_names(schema: dict[str, Any]) -> set[str]:
     return {str(name).lower() for name in props}
 
 
-def _infer_mcp_tool_capabilities(tool_def: Any, schema: dict[str, Any]) -> tuple[bool, bool]:
-    """Infer read-only and exclusive flags for a generic MCP tool.
-
-    The inference is intentionally conservative: explicit MCP annotations win,
-    obvious mutating names/schema keys are treated as side-effecting, and only
-    clearly read-like tools become resumable/concurrency-safe.
-    """
-    annotations = getattr(tool_def, "annotations", None)
-    read_hint = _annotation_bool(annotations, "readOnlyHint")
-    destructive_hint = _annotation_bool(annotations, "destructiveHint")
-    if read_hint is True and destructive_hint is not True:
-        return True, False
-    if destructive_hint is True:
-        return False, True
-
-    name = str(getattr(tool_def, "name", "") or "")
-    description = str(getattr(tool_def, "description", "") or "")
-    haystack = f"{name} {description}".lower()
-    property_names = _schema_property_names(schema)
-    has_mutating_schema_key = bool(property_names & _MUTATING_SCHEMA_KEYS)
-
-    if _MUTATING_NAME_RE.search(name) or has_mutating_schema_key:
-        return False, True
-    if _READ_ONLY_NAME_RE.search(name) or any(
-        marker in haystack
+def _description_mentions_read_only(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
         for marker in (
             "read-only",
             "read only",
@@ -124,10 +108,88 @@ def _infer_mcp_tool_capabilities(tool_def: Any, schema: dict[str, Any]) -> tuple
             "queries",
             "inspects",
             "describes",
+            "does not modify",
+            "without changing",
         )
+    )
+
+
+def _description_mentions_mutation(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "creates",
+            "updates",
+            "deletes",
+            "modifies",
+            "writes",
+            "executes",
+            "runs",
+            "applies changes",
+            "side effect",
+        )
+    )
+
+
+def _infer_mcp_tool_capabilities(
+    tool_def: Any,
+    schema: dict[str, Any],
+    *,
+    server_name: str = "",
+    transport_type: str = "",
+) -> tuple[bool, bool, str]:
+    """Infer read-only and exclusive flags for a generic MCP tool.
+
+    The inference is intentionally conservative: explicit MCP annotations win,
+    obvious mutating names/schema keys are treated as side-effecting, and only
+    clearly read-like tools become resumable/concurrency-safe.
+    """
+    annotations = getattr(tool_def, "annotations", None)
+    read_hint = _annotation_bool(annotations, "readOnlyHint")
+    destructive_hint = _annotation_bool(annotations, "destructiveHint")
+    if read_hint is True and destructive_hint is not True:
+        return True, False, "annotation"
+    if destructive_hint is True:
+        return False, True, "annotation"
+
+    name = str(getattr(tool_def, "name", "") or "")
+    description = str(getattr(tool_def, "description", "") or "")
+    property_names = _schema_property_names(schema)
+    has_mutating_schema_key = bool(property_names & _MUTATING_SCHEMA_KEYS)
+    remote_transport = transport_type in _REMOTE_MCP_TRANSPORTS
+    server_looks_read_only = bool(_READ_ONLY_SERVER_RE.search(server_name))
+
+    if (
+        _MUTATING_NAME_RE.search(name)
+        or has_mutating_schema_key
+        or _description_mentions_mutation(description)
     ):
-        return True, False
-    return False, False
+        return False, True, "heuristic_mutating"
+    if _READ_ONLY_NAME_RE.search(name) or _description_mentions_read_only(description):
+        return True, False, "heuristic_read"
+    if remote_transport and server_looks_read_only and not has_mutating_schema_key:
+        return True, False, "server_transport"
+    if server_looks_read_only and "query" in property_names and not _MUTATING_NAME_RE.search(name):
+        return True, False, "server_transport"
+    return False, False, "unknown"
+
+
+def _mcp_error_message(exc: BaseException) -> str:
+    exc_name = type(exc).__name__
+    detail = str(exc).strip()
+    lowered = detail.lower()
+    if any(
+        marker in lowered
+        for marker in ("parse error", "invalid json", "jsonrpc", "protocol", "content-length")
+    ):
+        return f"(MCP tool call failed: JSONRPC protocol error [{exc_name}: {detail or exc_name}])"
+    if any(
+        marker in lowered
+        for marker in ("permission", "unauthorized", "forbidden", "access denied")
+    ):
+        return f"(MCP tool call failed: permission denied [{exc_name}: {detail or exc_name}])"
+    return f"(MCP tool call failed: {exc_name})"
 
 
 async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
@@ -258,17 +320,29 @@ class MCPToolWrapper(Tool):
     _scopes = {"mcp"}
     config_key = "mcp"
 
-    def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        tool_def,
+        tool_timeout: int = 30,
+        *,
+        transport_type: str = "",
+    ):
         self._session = session
+        self._server_name = server_name
+        self._transport_type = transport_type
         self._original_name = tool_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_{tool_def.name}")
         self._description = tool_def.description or tool_def.name
         raw_schema = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._parameters = _normalize_schema_for_openai(raw_schema)
         self._tool_timeout = tool_timeout
-        self._read_only, self._exclusive = _infer_mcp_tool_capabilities(
+        self._read_only, self._exclusive, self._capability_source = _infer_mcp_tool_capabilities(
             tool_def,
             self._parameters,
+            server_name=server_name,
+            transport_type=transport_type,
         )
 
     @property
@@ -290,6 +364,14 @@ class MCPToolWrapper(Tool):
     @property
     def exclusive(self) -> bool:
         return self._exclusive
+
+    def registration_metadata(self) -> dict[str, Any]:
+        metadata = super().registration_metadata()
+        metadata["mcp_server"] = self._server_name
+        metadata["mcp_transport"] = self._transport_type
+        metadata["mcp_origin"] = "remote" if self._transport_type in _REMOTE_MCP_TRANSPORTS else "local"
+        metadata["mcp_capability_source"] = self._capability_source
+        return metadata
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
@@ -336,7 +418,7 @@ class MCPToolWrapper(Tool):
                     type(exc).__name__,
                     exc,
                 )
-                return f"(MCP tool call failed: {type(exc).__name__})"
+                return _mcp_error_message(exc)
             else:
                 # Success — extract result
                 parts = []
@@ -357,8 +439,18 @@ class MCPResourceWrapper(Tool):
     _scopes = {"mcp"}
     config_key = "mcp"
 
-    def __init__(self, session, server_name: str, resource_def, resource_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        resource_def,
+        resource_timeout: int = 30,
+        *,
+        transport_type: str = "",
+    ):
         self._session = session
+        self._server_name = server_name
+        self._transport_type = transport_type
         self._uri = resource_def.uri
         self._name = _sanitize_name(f"mcp_{server_name}_resource_{resource_def.name}")
         desc = resource_def.description or resource_def.name
@@ -385,6 +477,14 @@ class MCPResourceWrapper(Tool):
     @property
     def read_only(self) -> bool:
         return True
+
+    def registration_metadata(self) -> dict[str, Any]:
+        metadata = super().registration_metadata()
+        metadata["mcp_server"] = self._server_name
+        metadata["mcp_transport"] = self._transport_type
+        metadata["mcp_origin"] = "remote" if self._transport_type in _REMOTE_MCP_TRANSPORTS else "local"
+        metadata["mcp_capability_source"] = "resource"
+        return metadata
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
@@ -450,8 +550,18 @@ class MCPPromptWrapper(Tool):
     _scopes = {"mcp"}
     config_key = "mcp"
 
-    def __init__(self, session, server_name: str, prompt_def, prompt_timeout: int = 30):
+    def __init__(
+        self,
+        session,
+        server_name: str,
+        prompt_def,
+        prompt_timeout: int = 30,
+        *,
+        transport_type: str = "",
+    ):
         self._session = session
+        self._server_name = server_name
+        self._transport_type = transport_type
         self._prompt_name = prompt_def.name
         self._name = _sanitize_name(f"mcp_{server_name}_prompt_{prompt_def.name}")
         desc = prompt_def.description or prompt_def.name
@@ -492,6 +602,14 @@ class MCPPromptWrapper(Tool):
     @property
     def read_only(self) -> bool:
         return True
+
+    def registration_metadata(self) -> dict[str, Any]:
+        metadata = super().registration_metadata()
+        metadata["mcp_server"] = self._server_name
+        metadata["mcp_transport"] = self._transport_type
+        metadata["mcp_origin"] = "remote" if self._transport_type in _REMOTE_MCP_TRANSPORTS else "local"
+        metadata["mcp_capability_source"] = "prompt"
+        return metadata
 
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
@@ -678,7 +796,13 @@ async def connect_mcp_servers(
                         name,
                     )
                     continue
-                wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
+                wrapper = MCPToolWrapper(
+                    session,
+                    name,
+                    tool_def,
+                    tool_timeout=cfg.tool_timeout,
+                    transport_type=transport_type,
+                )
                 registry.register(wrapper)
                 logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
                 registered_count += 1
@@ -704,7 +828,11 @@ async def connect_mcp_servers(
                 resources_result = await session.list_resources()
                 for resource in resources_result.resources:
                     wrapper = MCPResourceWrapper(
-                        session, name, resource, resource_timeout=cfg.tool_timeout
+                        session,
+                        name,
+                        resource,
+                        resource_timeout=cfg.tool_timeout,
+                        transport_type=transport_type,
                     )
                     registry.register(wrapper)
                     registered_count += 1
@@ -718,7 +846,11 @@ async def connect_mcp_servers(
                 prompts_result = await session.list_prompts()
                 for prompt in prompts_result.prompts:
                     wrapper = MCPPromptWrapper(
-                        session, name, prompt, prompt_timeout=cfg.tool_timeout
+                        session,
+                        name,
+                        prompt,
+                        prompt_timeout=cfg.tool_timeout,
+                        transport_type=transport_type,
                     )
                     registry.register(wrapper)
                     registered_count += 1

@@ -297,11 +297,98 @@ class TestBuildSystemPrompt:
         assert test_fix["source"] == "explicit"
         assert test_fix["reason"] == "explicit request"
 
+    def test_auto_selects_frontend_implementation_skill_from_current_message(self, tmp_path):
+        builder = _builder(tmp_path)
+        result = builder.build_system_prompt(
+            current_message="Implement a responsive React component and adjust the page layout CSS."
+        )
+        assert "### Skill: coding-assistant" in result
+        assert "### Skill: frontend-implementation" in result
+
+    def test_build_active_skills_snapshot_includes_dependency_upgrade_match(self, tmp_path):
+        builder = _builder(tmp_path)
+        snapshot = builder.build_active_skills_snapshot(
+            current_message="Please upgrade dependency versions and bump the package upgrade safely."
+        )
+
+        upgrade = next(
+            skill for skill in snapshot["skills"] if skill["name"] == "dependency-upgrade"
+        )
+        assert upgrade["source"] == "auto"
+        assert "upgrade dependency" in upgrade["matched_keywords"] or "dependency upgrade" in upgrade["matched_keywords"]
+
+    def test_active_skills_snapshot_filters_conflicting_migration_skill(self, tmp_path):
+        builder = _builder(tmp_path)
+        snapshot = builder.build_active_skills_snapshot(
+            current_message="Plan the migration rollout and upgrade dependency versions safely."
+        )
+
+        names = [skill["name"] for skill in snapshot["skills"]]
+        assert "dependency-upgrade" in names
+        assert "migration-planning" not in names
+
+    def test_build_system_prompt_filters_conflicting_review_and_test_fix_combo(self, tmp_path):
+        builder = _builder(tmp_path)
+        result = builder.build_system_prompt(
+            current_message="Please review this pytest failure and regression risk."
+        )
+
+        assert "### Skill: coding-assistant" in result
+        assert "### Skill: code-review" in result
+        assert "### Skill: test-fix" not in result
+
     def test_sections_separated_by_separator(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Rules.", encoding="utf-8")
         builder = _builder(tmp_path)
         result = builder.build_system_prompt(session_summary="Summary.")
         assert "\n\n---\n\n" in result
+
+    def test_structured_summary_renders_decisions_before_overview(self, tmp_path):
+        builder = _builder(tmp_path)
+        result = builder.build_system_prompt(
+            session_metadata={
+                "_last_summary": {
+                    "sections": {
+                        "overview": ["Low signal overview"],
+                        "decisions": ["Decision: keep the websocket retry path."],
+                        "files_touched": ["nanobot/channels/websocket.py"],
+                    }
+                }
+            }
+        )
+
+        decisions_index = result.index("## Decisions")
+        overview_index = result.index("## Overview")
+        assert decisions_index < overview_index
+
+    def test_extract_retrieval_signals_prioritizes_paths_and_failures(self, tmp_path):
+        builder = _builder(tmp_path)
+
+        signals = builder._extract_retrieval_signals(
+            "Please inspect nanobot/api/server.py\n"
+            "The gateway request timed out with traceback output.\n"
+            "General note without strong signal."
+        )
+
+        lines = signals.splitlines()
+        assert lines[0] == "nanobot/api/server.py"
+        assert any("timed out" in line for line in lines)
+
+    def test_build_retrieval_query_omits_wrapper_labels(self, tmp_path):
+        builder = _builder(tmp_path)
+
+        query = builder._build_retrieval_query(
+            "Decision: keep websocket retry path.",
+            "Inspect nanobot/channels/websocket.py after timeout failure.",
+            recent_history=[
+                {"content": "pytest failed in tests/agent/test_context_builder.py"},
+            ],
+        )
+
+        assert "Current request signals" not in query
+        assert "Recent history signals" not in query
+        assert "nanobot/channels/websocket.py" in query
+        assert "pytest failed" in query
 
     def test_no_bootstrap_no_summary(self, tmp_path):
         builder = _builder(tmp_path)

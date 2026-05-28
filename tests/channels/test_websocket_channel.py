@@ -12,6 +12,7 @@ import pytest
 import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
+from websockets.http11 import Request
 
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -28,6 +29,7 @@ from nanobot.channels.websocket import (
     _parse_request_path,
     publish_runtime_model_update,
 )
+from nanobot.session.webui_turns import build_turn_checkpoint
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import Config, ModelPresetConfig
 from nanobot.webui.settings_api import settings_payload
@@ -55,6 +57,11 @@ def bus() -> MagicMock:
     b = MagicMock()
     b.publish_inbound = AsyncMock()
     return b
+
+
+@pytest.fixture(autouse=True)
+def isolate_webui_runtime_dir(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
 
 
 async def _http_get(url: str, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -1760,3 +1767,84 @@ def test_handle_webui_thread_get_returns_json(tmp_path, monkeypatch) -> None:
     assert len(body["messages"]) == 1
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_handle_recovery_action_returns_webui_checkpoint_shape() -> None:
+    from websockets.datastructures import Headers
+
+    bus = MagicMock()
+    channel = _ch(bus)
+    channel._api_tokens["tok"] = time.monotonic() + 300.0
+    channel._session_manager = MagicMock()
+    session = MagicMock()
+    session.key = "websocket:chat-1"
+    channel._session_manager.get_or_create.return_value = session
+    channel._recovery_action_handler = AsyncMock(return_value={
+        "checkpoint_id": "chk-1",
+        "phase": "tools_completed",
+        "updated_at": "2026-05-27T00:00:00+00:00",
+        "pending_tool_calls": [
+            {
+                "id": "call-shell",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"pytest -q\"}"},
+            }
+        ],
+        "review_required_tool_call_ids": ["call-shell"],
+        "review_required_tool_count": 1,
+        "recovery_review_items": [
+            {
+                "tool_call_id": "call-shell",
+                "name": "exec",
+                "group": "review_required",
+                "reason": "shell_command_requires_review",
+                "recovery_action": "review_before_retry",
+            }
+        ],
+    })
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    req = Request(
+        "/api/webui/recovery-action?session_key=websocket%3Achat-1&tool_call_id=call-shell&action=confirm_retry",
+        Headers([("Authorization", "Bearer tok")]),
+    )
+    resp = await channel._handle_recovery_action(req)
+
+    assert resp.status_code == 200
+    body = json.loads(resp.body.decode())
+    assert body["ok"] is True
+    assert body["checkpoint"] == {
+        **build_turn_checkpoint({
+            "checkpoint_id": "chk-1",
+            "phase": "tools_completed",
+            "updated_at": "2026-05-27T00:00:00+00:00",
+            "pending_tool_calls": [
+                {
+                    "id": "call-shell",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{\"command\":\"pytest -q\"}"},
+                }
+            ],
+            "review_required_tool_call_ids": ["call-shell"],
+            "review_required_tool_count": 1,
+            "recovery_review_items": [
+                {
+                    "tool_call_id": "call-shell",
+                    "name": "exec",
+                    "group": "review_required",
+                    "reason": "shell_command_requires_review",
+                    "recovery_action": "review_before_retry",
+                }
+            ],
+        }, turn_id="websocket:chat-1:recovery-review"),
+        "source": "recovered",
+        "recovered": True,
+        "recovered_pending_tool_count": 1,
+    }
+    mock_ws.send.assert_awaited_once()
+    pushed = json.loads(mock_ws.send.await_args.args[0])
+    assert pushed["event"] == "checkpoint"
+    assert pushed["chat_id"] == "chat-1"
+    assert pushed["checkpoint"]["turn_id"] == "websocket:chat-1:recovery-review"

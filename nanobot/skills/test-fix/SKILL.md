@@ -1,7 +1,7 @@
 ---
 name: test-fix
 description: "Use for test/build failures: inspect the failing signal, apply the smallest fix, and rerun focused checks."
-metadata: {"nanobot":{"task_keywords":["test failed","tests failed","pytest","vitest","npm test","bun test","build failed","测试失败","单测失败","报错","traceback"],"priority":75}}
+metadata: {"nanobot":{"task_keywords":["test failed","tests failed","pytest","vitest","npm test","bun test","build failed","测试失败","单测失败","报错","traceback"],"priority":75,"conflicts_with":["code-review"]}}
 ---
 
 # Test Fix

@@ -23,7 +23,9 @@ interface ThreadViewportProps {
   emptyState?: ReactNode;
   scrollToBottomSignal?: number;
   conversationKey?: string | null;
+  sessionKey?: string | null;
   showScrollToBottomButton?: boolean;
+  onResumeSafeTools?: () => void;
 }
 
 const NEAR_BOTTOM_PX = 48;
@@ -52,7 +54,9 @@ export function ThreadViewport({
   emptyState,
   scrollToBottomSignal = 0,
   conversationKey = null,
+  sessionKey = null,
   showScrollToBottomButton = true,
+  onResumeSafeTools,
 }: ThreadViewportProps) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -247,8 +251,10 @@ export function ThreadViewport({
                 <ThreadMessages
                   messages={visibleMessages}
                   isStreaming={isStreaming}
+                  sessionKey={sessionKey}
                   hiddenMessageCount={hiddenMessageCount}
                   onLoadEarlier={loadEarlierMessages}
+                  onResumeSafeTools={onResumeSafeTools}
                 />
               </div>
             </div>

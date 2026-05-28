@@ -170,7 +170,7 @@ class SkillsLoader:
         if not text.strip() or limit <= 0:
             return []
         excluded = exclude or set()
-        matches: list[tuple[int, float, str, list[str], str]] = []
+        matches: list[dict[str, object]] = []
         for entry in self.list_skills(filter_unavailable=True):
             name = entry["name"]
             if name in excluded:
@@ -187,28 +187,78 @@ class SkillsLoader:
             )
             if not keywords:
                 continue
-            matched_keywords = [
-                keyword for keyword in keywords if keyword.casefold() in text
-            ]
+            matched_keywords = self._matched_keywords(keywords, text)
             score = len(matched_keywords)
             if score <= 0:
                 continue
             priority = self._metadata_priority(
                 nanobot_meta.get("priority", meta.get("priority", 0))
             )
-            matches.append((score, priority, name, matched_keywords, entry["source"]))
-        matches.sort(key=lambda item: (-item[1], -item[0], item[2]))
-        return [
-            {
+            matches.append({
                 "name": name,
                 "source": "auto",
                 "matched_keywords": matched_keywords,
                 "priority": priority,
                 "reason": "matched: " + ", ".join(matched_keywords[:3]),
-                "skill_source": skill_source,
+                "skill_source": entry["source"],
+                "score": score,
+                "specificity": sum(len(keyword) for keyword in matched_keywords),
+                "conflicts_with": self._metadata_name_set(
+                    nanobot_meta.get("conflicts_with") or meta.get("conflicts_with")
+                ),
+            })
+        matches.sort(
+            key=lambda item: (
+                -float(item["priority"]),
+                -int(item["score"]),
+                -int(item["specificity"]),
+                str(item["name"]),
+            )
+        )
+        selected: list[dict[str, object]] = []
+        blocked_names: set[str] = set()
+        for match in matches:
+            name = str(match["name"])
+            if name in blocked_names:
+                continue
+            conflicts_with = {
+                str(item)
+                for item in match.get("conflicts_with", set())
+                if isinstance(item, str)
             }
-            for _, priority, name, matched_keywords, skill_source in matches[:limit]
+            if any(str(existing["name"]) in conflicts_with for existing in selected):
+                continue
+            selected.append({
+                "name": name,
+                "source": str(match["source"]),
+                "matched_keywords": list(match["matched_keywords"]),
+                "priority": float(match["priority"]),
+                "reason": str(match["reason"]),
+                "skill_source": str(match["skill_source"]),
+            })
+            blocked_names.add(name)
+            blocked_names.update(conflicts_with)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    @staticmethod
+    def _matched_keywords(keywords: list[str], text: str) -> list[str]:
+        matched = [
+            keyword.strip()
+            for keyword in keywords
+            if keyword.strip() and keyword.casefold() in text
         ]
+        matched.sort(key=lambda item: (-len(item), item.casefold()))
+        return matched
+
+    @staticmethod
+    def _metadata_name_set(raw: object) -> set[str]:
+        return {
+            str(item).strip()
+            for item in SkillsLoader._metadata_strings(raw)
+            if str(item).strip()
+        }
 
     @staticmethod
     def _metadata_strings(raw: object) -> list[str]:

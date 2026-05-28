@@ -12,8 +12,10 @@ interface ThreadMessagesProps {
   messages: UIMessage[];
   /** When true, agent turn still in flight — keeps activity cluster expanded. */
   isStreaming?: boolean;
+  sessionKey?: string | null;
   hiddenMessageCount?: number;
   onLoadEarlier?: () => void;
+  onResumeSafeTools?: () => void;
 }
 
 export type DisplayUnit =
@@ -162,8 +164,10 @@ export function assistantCopyFlags(units: DisplayUnit[]): boolean[] {
 export function ThreadMessages({
   messages,
   isStreaming = false,
+  sessionKey = null,
   hiddenMessageCount = 0,
   onLoadEarlier,
+  onResumeSafeTools,
 }: ThreadMessagesProps) {
   const { t } = useTranslation();
   const units = useMemo(() => buildDisplayUnits(messages), [messages]);
@@ -204,11 +208,13 @@ export function ThreadMessages({
         return (
           <div key={unitKey(unit, index)} className={marginTop}>
             {unit.type === "cluster" ? (
-              <AgentActivityCluster
-                messages={unit.messages}
-                isTurnStreaming={index === liveActivityClusterIndex}
-                hasBodyBelow={hasBodyBelow}
-              />
+                <AgentActivityCluster
+                  messages={unit.messages}
+                  isTurnStreaming={index === liveActivityClusterIndex}
+                  hasBodyBelow={hasBodyBelow}
+                  sessionKey={sessionKey}
+                  onResumeSafeTools={onResumeSafeTools}
+                />
             ) : (
               <MessageBubble
                 message={unit.message}

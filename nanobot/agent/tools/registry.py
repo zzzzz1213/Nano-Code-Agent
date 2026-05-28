@@ -3,7 +3,7 @@
 from copy import deepcopy
 from typing import Any, cast
 
-from nanobot.agent.tools.base import Tool, ToolRegistrationMetadata
+from nanobot.agent.tools.base import Tool, ToolRegistrationError, ToolRegistrationMetadata
 
 
 class ToolRegistry:
@@ -20,10 +20,10 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
-        errors = tool.validate_registration()
-        if errors:
+        issues = tool.registration_issues()
+        if issues:
             label = getattr(tool, "name", type(tool).__name__)
-            raise ValueError(f"Invalid tool registration for {label!r}: {'; '.join(errors)}")
+            raise ToolRegistrationError(label, issues)
         self._tools[tool.name] = tool
         self._metadata[tool.name] = tool.registration_metadata()
         self._cached_definitions = None

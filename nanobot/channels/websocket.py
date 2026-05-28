@@ -39,7 +39,7 @@ from nanobot.command.builtin import builtin_command_palette
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.session.goal_state import goal_state_ws_blob
-from nanobot.session.webui_turns import websocket_turn_wall_started_at
+from nanobot.session.webui_turns import build_turn_checkpoint, websocket_turn_wall_started_at
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
     FileSizeExceeded,
@@ -452,6 +452,7 @@ class WebSocketChannel(BaseChannel):
         session_manager: "SessionManager | None" = None,
         static_dist_path: Path | None = None,
         runtime_model_name: Callable[[], str | None] | None = None,
+        recovery_action_handler: Callable[..., Any] | None = None,
     ):
         if isinstance(config, dict):
             config = WebSocketConfig.model_validate(config)
@@ -474,6 +475,7 @@ class WebSocketChannel(BaseChannel):
             static_dist_path.resolve() if static_dist_path is not None else None
         )
         self._runtime_model_name = runtime_model_name
+        self._recovery_action_handler = recovery_action_handler
         self._settings_restart_sections: set[str] = set()
         # Process-local secret used to HMAC-sign media URLs. The signed URL is
         # the capability — anyone who holds a valid URL can fetch that one
@@ -645,6 +647,9 @@ class WebSocketChannel(BaseChannel):
 
         if got == "/api/webui/memory-candidate/commit":
             return self._handle_memory_candidate_commit(request)
+
+        if got == "/api/webui/recovery-action":
+            return await self._handle_recovery_action(request)
 
         if got == "/api/settings/update":
             return self._handle_settings_update(request)
@@ -861,6 +866,55 @@ class WebSocketChannel(BaseChannel):
             self.logger.exception("failed to commit memory candidate")
             return _http_error(500, "failed to write memory")
         return _http_json_response(result)
+
+    async def _handle_recovery_action(self, request: WsRequest) -> Response:
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        if not callable(self._recovery_action_handler):
+            return _http_error(503, "recovery action handler unavailable")
+        query = _parse_query(request.path)
+        session_key = _query_first(query, "session_key")
+        tool_call_id = _query_first(query, "tool_call_id")
+        action = _query_first(query, "action")
+        user_input = _query_first(query, "user_input")
+        if not session_key:
+            return _http_error(400, "missing session_key")
+        if not tool_call_id:
+            return _http_error(400, "missing tool_call_id")
+        if not action:
+            return _http_error(400, "missing action")
+        session = self._session_manager.get_or_create(session_key)
+        checkpoint = await self._recovery_action_handler(
+            session,
+            tool_call_id=tool_call_id,
+            action=action,
+            user_input=user_input,
+        )
+        if checkpoint is None:
+            return _http_error(404, "recovery action could not be applied")
+        chat_id = session_key.split(":", 1)[1] if session_key.startswith("websocket:") else session_key
+        checkpoint_payload = build_turn_checkpoint(
+            checkpoint,
+            turn_id=f"{session_key}:recovery-review",
+        )
+        checkpoint_payload["source"] = "recovered"
+        checkpoint_payload["recovered"] = True
+        checkpoint_payload["recovered_pending_tool_count"] = checkpoint_payload.get(
+            "pending_tool_count",
+            0,
+        )
+        payload: dict[str, Any] = {
+            "event": "checkpoint",
+            "chat_id": chat_id,
+            "checkpoint": checkpoint_payload,
+        }
+        self._try_append_webui_transcript(chat_id, payload)
+        raw = json.dumps(payload, ensure_ascii=False)
+        for connection in list(self._subs.get(chat_id, ())):
+            await self._safe_send_to(connection, raw, label=" checkpoint ")
+        return _http_json_response({"ok": True, "checkpoint": checkpoint_payload})
 
     def _handle_settings_update(self, request: WsRequest) -> Response:
         if not self._check_api_token(request):

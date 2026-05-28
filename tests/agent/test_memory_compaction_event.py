@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.agent.memory import Consolidator, MemoryStore, _build_compaction_event
+from nanobot.agent.memory import (
+    Consolidator,
+    MemoryStore,
+    _build_compaction_event,
+    _parse_summary_sections,
+)
 from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import SessionManager
 
@@ -92,3 +97,58 @@ Next steps:
     failures = event["summary_sections"]["failures"]
     assert any("RuntimeError: build failed" in failure for failure in failures)
     assert all(len(failure) <= 320 for failure in failures)
+
+
+def test_parse_summary_sections_keeps_recent_items() -> None:
+    summary = "\n".join(
+        [
+            "Commands run:",
+            *[f"- pytest tests/agent/test_case_{i}.py -q" for i in range(10)],
+        ]
+    )
+
+    sections = _parse_summary_sections(summary)
+
+    assert len(sections["commands_run"]) == 8
+    assert sections["commands_run"][0] == "pytest tests/agent/test_case_2.py -q"
+    assert sections["commands_run"][-1] == "pytest tests/agent/test_case_9.py -q"
+
+
+def test_compaction_event_prioritizes_recent_signals_and_mixed_failures() -> None:
+    archived_messages = [
+        {"role": "assistant", "content": "Decision: keep the old path around for now."},
+        {"role": "user", "content": "确认，按这个方案继续"},
+        {
+            "role": "assistant",
+            "content": "\n".join(
+                [
+                    "Edited nanobot/agent/loop.py and webui/src/lib/types.ts",
+                    "pytest tests/agent/test_memory_compaction_event.py -q",
+                    "Traceback (most recent call last):",
+                    "RuntimeError: request timed out while rebuilding checkpoint",
+                    "最终错误: 构建失败，需要修复超时逻辑",
+                    "Next steps: add compaction regression coverage",
+                ]
+            ),
+        },
+    ]
+
+    event = _build_compaction_event(
+        reason="token_budget",
+        source="token_consolidator",
+        before_messages=archived_messages,
+        after_messages=[],
+        archived_messages=archived_messages,
+        summary="Overview: previous summary text.",
+    )
+
+    decisions = event["summary_sections"]["decisions"]
+    failures = event["summary_sections"]["failures"]
+    files_touched = event["summary_sections"]["files_touched"]
+
+    assert "User confirmed: 确认，按这个方案继续" in decisions
+    assert "nanobot/agent/loop.py" in files_touched
+    assert "webui/src/lib/types.ts" in files_touched
+    assert any("Command: pytest tests/agent/test_memory_compaction_event.py -q" in item for item in failures)
+    assert any("构建失败" in item for item in failures)
+    assert event["summary_preview"].startswith("## Goal") or "## Decisions" in event["summary_preview"]
